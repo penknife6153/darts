@@ -1,6 +1,10 @@
+"""
+Base Likelihood Model
+---------------------
+"""
+
 from collections.abc import Sequence
 from enum import Enum
-from typing import Optional, Union
 
 import pandas as pd
 
@@ -28,6 +32,7 @@ class LikelihoodType(Enum):
     LogNormal = "lognormal"
     Weibull = "weibull"
     Quantile = "quantile"
+    MultiQuantile = "multiquantile"
     ClassProbability = "classprobability"
 
 
@@ -66,8 +71,8 @@ class Likelihood:
 
     def component_names(
         self,
-        series: Optional[TimeSeries] = None,
-        components: Optional[Sequence] = None,
+        series: TimeSeries | None = None,
+        components: Sequence | None = None,
     ) -> list[str]:
         """Generates names for the parameters of the Likelihood."""
         if (series is not None) == (components is not None):
@@ -124,7 +129,7 @@ class Likelihood:
 
 
 def likelihood_component_names(
-    components: Union[pd.Index, list[str]], parameter_names: list[str]
+    components: pd.Index | list[str], parameter_names: list[str]
 ):
     """Generates formatted likelihood parameter names for components and parameter names.
 
@@ -144,7 +149,7 @@ def likelihood_component_names(
     ]
 
 
-def quantile_names(q: Union[float, list[float]], component: Optional[str] = None):
+def quantile_names(q: float | list[float], component: str | None = None):
     """Generates formatted quantile names, optionally added to a component name.
 
     Parameters
@@ -157,14 +162,14 @@ def quantile_names(q: Union[float, list[float]], component: Optional[str] = None
     # predicted quantile text format
     comp = f"{component}_" if component is not None else ""
     if isinstance(q, float):
-        return f"{comp}q{q:.2f}"
+        return f"{comp}q{q:.3f}"
     else:
-        return [f"{comp}q{q_i:.2f}" for q_i in q]
+        return [f"{comp}q{q_i:.3f}" for q_i in q]
 
 
 def quantile_interval_names(
-    q_interval: Union[tuple[float, float], Sequence[tuple[float, float]]],
-    component: Optional[str] = None,
+    q_interval: tuple[float, float] | Sequence[tuple[float, float]],
+    component: str | None = None,
 ):
     """Generates formatted quantile interval names, optionally added to a component name.
 
@@ -178,6 +183,6 @@ def quantile_interval_names(
     # predicted quantile text format
     comp = f"{component}_" if component is not None else ""
     if isinstance(q_interval, tuple):
-        return f"{comp}q{q_interval[0]:.2f}_q{q_interval[1]:.2f}"
+        return f"{comp}q{q_interval[0]:.3f}_q{q_interval[1]:.3f}"
     else:
-        return [f"{comp}q{q_lo:.2f}_q{q_hi:.2f}" for q_lo, q_hi in q_interval]
+        return [f"{comp}q{q_lo:.3f}_q{q_hi:.3f}" for q_lo, q_hi in q_interval]

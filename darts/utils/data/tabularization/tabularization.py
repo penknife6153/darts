@@ -1,9 +1,16 @@
+"""
+Data Tabularization Methods
+---------------------------
+
+Tabularization methods to convert time series data into tabular format for usage with SKLearn-like models.
+"""
+
 import warnings
 from collections.abc import Sequence
 from functools import reduce
 from itertools import chain
 from math import inf
-from typing import Literal, Optional, Union
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -11,6 +18,7 @@ from numpy.lib.stride_tricks import as_strided
 
 from darts import TimeSeries
 from darts.logging import get_logger, raise_log
+from darts.typing import TimeIndex, TimeSeriesLike
 from darts.utils.data.utils import _process_sample_weight
 from darts.utils.ts_utils import get_single_series, series2seq
 from darts.utils.utils import n_steps_between
@@ -20,37 +28,37 @@ logger = get_logger(__name__)
 NP_2_OR_ABOVE = int(np.__version__.split(".")[0]) >= 2
 STABLE_SORT_KWARGS = {"stable": True} if NP_2_OR_ABOVE else {"kind": "stable"}
 
-ArrayOrArraySequence = Union[np.ndarray, Sequence[np.ndarray]]
+ArrayOrArraySequence = np.ndarray | Sequence[np.ndarray]
 
 
 def create_lagged_data(
-    target_series: Optional[Union[TimeSeries, Sequence[TimeSeries]]] = None,
-    past_covariates: Optional[Union[TimeSeries, Sequence[TimeSeries]]] = None,
-    future_covariates: Optional[Union[TimeSeries, Sequence[TimeSeries]]] = None,
-    lags: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
-    lags_past_covariates: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
-    lags_future_covariates: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
+    target_series: TimeSeriesLike | None = None,
+    past_covariates: TimeSeriesLike | None = None,
+    future_covariates: TimeSeriesLike | None = None,
+    lags: Sequence[int] | dict[str, list[int]] | None = None,
+    lags_past_covariates: Sequence[int] | dict[str, list[int]] | None = None,
+    lags_future_covariates: Sequence[int] | dict[str, list[int]] | None = None,
     output_chunk_length: int = 1,
     output_chunk_shift: int = 0,
     uses_static_covariates: bool = True,
-    last_static_covariates_shape: Optional[tuple[int, int]] = None,
-    max_samples_per_ts: Optional[int] = None,
+    last_static_covariates_shape: tuple[int, int] | None = None,
+    max_samples_per_ts: int | None = None,
     multi_models: bool = True,
     check_inputs: bool = True,
     use_moving_windows: bool = True,
     is_training: bool = True,
     concatenate: bool = True,
-    sample_weight: Optional[Union[str, TimeSeries, Sequence[TimeSeries]]] = None,
+    sample_weight: str | TimeSeriesLike | None = None,
     stride: int = 1,
     show_warnings: bool = True,
 ) -> tuple[
     ArrayOrArraySequence,
-    Union[None, ArrayOrArraySequence],
+    None | ArrayOrArraySequence,
     Sequence[pd.Index],
-    Optional[tuple[int, int]],
-    Optional[ArrayOrArraySequence],
+    tuple[int, int] | None,
+    ArrayOrArraySequence | None,
 ]:
-    """
+    r"""
     Creates the features array `X` and labels array `y` to train a lagged-variables `SKLearnModel` when
     `is_training = True`; alternatively, creates the features array `X` to produce a series of prediction from an
     already-trained model when `is_training = False`. In both cases, a list of time indices corresponding to
@@ -59,10 +67,12 @@ def create_lagged_data(
     Notes
     -----
     Instead of calling `create_lagged_data` directly, it is instead recommended that:
-        - `create_lagged_training_data` be called if one wishes to create the `X` and `y` arrays
-        to train an `SKLearnModel`.
-        - `create_lagged_prediction_data` be called if one wishes to create the `X` array required
-        to generate a prediction from an already-trained `SKLearnModel`.
+
+    - `create_lagged_training_data` be called if one wishes to create the `X` and `y` arrays
+      to train an `SKLearnModel`.
+    - `create_lagged_prediction_data` be called if one wishes to create the `X` array required
+      to generate a prediction from an already-trained `SKLearnModel`.
+
     This is because even though both of these functions are merely wrappers around `create_lagged_data`, their
     call signatures are more easily interpreted than `create_lagged_data`. For example,
     `create_lagged_prediction_data` does not accept `output_chunk_length` nor `multi_models` as inputs, since
@@ -70,34 +80,48 @@ def create_lagged_data(
     returns only `X` and `times` as outputs, as opposed to returning `y` as `None` along with `X` and `times`.
 
     The `X` array is constructed from the lagged values of up to three separate timeseries:
-        1. The `target_series`, which contains the values we're trying to predict. An `SKLearnModel` that
-        uses previous values of the target its predicting is referred to as *autoregressive*; please refer to
-        [1]_ for further details about autoregressive timeseries models.
-        2. The past covariates series, which contains values that are *not* known into the future. Unlike
-        the target series, however, past covariates are *not* to be predicted by the `SKLearnModel`.
-        3. The future covariates (AKA 'exogenous' covariates) series, which contains values that are known
-        into the future, even beyond the data in `target_series` and `past_covariates`.
+
+    1. The `target_series`, which contains the values we're trying to predict. An `SKLearnModel` that
+       uses previous values of the target its predicting is referred to as *autoregressive*; please refer to
+       [1]_ for further details about autoregressive timeseries models.
+    2. The past covariates series, which contains values that are *not* known into the future. Unlike
+       the target series, however, past covariates are *not* to be predicted by the `SKLearnModel`.
+    3. The future covariates (AKA 'exogenous' covariates) series, which contains values that are known
+       into the future, even beyond the data in `target_series` and `past_covariates`.
+
     See [2]_ for a more detailed discussion about target, past, and future covariates. Conversely, `y` is
     comprised only of the lagged values of `target_series`.
 
-    The shape of `X` is:
-        `X.shape = (n_observations, n_lagged_features, n_samples)`,
-    where `n_observations` equals either the number of time points shared between all specified series,
-    or `max_samples_per_ts`, whichever is smallest.
-    The shape of `y` is:
-        `y.shape = (n_observations, output_chunk_length, n_samples)`,
-    if `multi_models = True`, otherwise:
-        `y.shape = (n_observations, 1, n_samples)`.
+    The shape of `X` is: `(n_observations, n_lagged_features, n_samples)`, where `n_observations` equals either the
+    number of time points shared between all specified series, or `max_samples_per_ts`, whichever is smallest.
+    The shape of `y` is: `(n_observations, output_chunk_length, n_samples)`, if `multi_models = True`, otherwise:
+    `(n_observations, 1, n_samples)`.
 
-    Along the `n_lagged_features` axis, `X` has the following structure (for `*_lags=[-2,-1]` and
-    `*_series.n_components = 2`):
+    Along the `n_lagged_features` axis, `X` has the following structure (for `\*_lags=[-2,-1]` and
+    `\*_series.n_components = 2`):
+
+    .. highlight:: md
+    .. code-block:: md
+
         lagged_target | lagged_past_covariates | lagged_future_covariates
-    where each `lagged_*` has the following structure:
+    ..
+
+    where each `lagged_\*` has the following structure:
+
+    .. highlight:: md
+    .. code-block:: md
+
         lag_-2_comp_1_* | lag_-2_comp_2_* | lag_-1_comp_1_* | lag_-1_comp_2_*
+    ..
 
     Along the `n_lagged_labels` axis, `y` has the following structure (for `output_chunk_length=4` and
     `target_series.n_components=2`):
+
+    .. highlight:: md
+    .. code-block:: md
+
         lag_+0_comp_1_target | lag_+0_comp_2_target | ... | lag_+3_comp_1_target | lag_+3_comp_2_target
+    ..
 
     The `lags` and `lags_past_covariates` must contain only values less than or equal to -1. In other words, one
     cannot use the value of either of these series at time `t` to predict the value of the target series at the
@@ -108,11 +132,13 @@ def create_lagged_data(
 
     The exact method used to construct `X` and `y` depends on whether all specified timeseries are
     of the same frequency or not:
-        - If all specified timeseries are of the same frequency, `strided_moving_window` is used to extract
-        contiguous time blocks from each timeseries; the lagged variables are then extracted from each window.
-        - If all specified timeseries are *not* of the same frequency, then `find_shared_times` is first used
-        to find those times common to all three timeseries, after which the lagged features are extracted by
-        offsetting the time indices of these common times by the requested lags.
+
+    - If all specified timeseries are of the same frequency, `strided_moving_window` is used to extract
+      contiguous time blocks from each timeseries; the lagged variables are then extracted from each window.
+    - If all specified timeseries are *not* of the same frequency, then `find_shared_times` is first used
+      to find those times common to all three timeseries, after which the lagged features are extracted by
+      offsetting the time indices of these common times by the requested lags.
+
     In cases where it can be validly applied, the 'moving window' method is expected to be faster than the
     'intersecting time' method. However, in exceptional cases where only a small number of lags are being
     extracted, but the difference between the lag values is large (e.g. `lags = [-1, -1000]`), the 'moving
@@ -190,7 +216,7 @@ def create_lagged_data(
         If `False`, then the `SKLearnModel` is assumed to predict *only* the time step at `t+output_chunk_length`.
         This input is ignored if `is_training = False`.
     check_inputs
-        Optionally, specifies that the `lags_*` and `series_*` inputs should be checked for validity. Should be set
+        Optionally, specifies that the `lags_\*` and `series_\*` inputs should be checked for validity. Should be set
         to `False` if inputs have already been checked for validity (e.g. inside the `__init__` of a class), otherwise
         should be set to `True`.
     use_moving_windows
@@ -412,29 +438,29 @@ def create_lagged_data(
 
 
 def create_lagged_training_data(
-    target_series: Union[TimeSeries, Sequence[TimeSeries]],
+    target_series: TimeSeriesLike,
     output_chunk_length: int,
     output_chunk_shift: int,
-    past_covariates: Optional[Union[TimeSeries, Sequence[TimeSeries]]] = None,
-    future_covariates: Optional[Union[TimeSeries, Sequence[TimeSeries]]] = None,
-    lags: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
-    lags_past_covariates: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
-    lags_future_covariates: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
+    past_covariates: TimeSeriesLike | None = None,
+    future_covariates: TimeSeriesLike | None = None,
+    lags: Sequence[int] | dict[str, list[int]] | None = None,
+    lags_past_covariates: Sequence[int] | dict[str, list[int]] | None = None,
+    lags_future_covariates: Sequence[int] | dict[str, list[int]] | None = None,
     uses_static_covariates: bool = True,
-    last_static_covariates_shape: Optional[tuple[int, int]] = None,
-    max_samples_per_ts: Optional[int] = None,
+    last_static_covariates_shape: tuple[int, int] | None = None,
+    max_samples_per_ts: int | None = None,
     multi_models: bool = True,
     check_inputs: bool = True,
     use_moving_windows: bool = True,
     concatenate: bool = True,
     stride: int = 1,
-    sample_weight: Optional[Union[TimeSeries, str]] = None,
+    sample_weight: TimeSeries | str | None = None,
 ) -> tuple[
     ArrayOrArraySequence,
-    Union[None, ArrayOrArraySequence],
+    None | ArrayOrArraySequence,
     Sequence[pd.Index],
-    Optional[tuple[int, int]],
-    Optional[ArrayOrArraySequence],
+    tuple[int, int] | None,
+    ArrayOrArraySequence | None,
 ]:
     """
     Creates the features array `X` and labels array `y` to train a lagged-variables `SKLearnModel` (e.g. an
@@ -578,15 +604,15 @@ def create_lagged_training_data(
 
 
 def create_lagged_prediction_data(
-    target_series: Optional[Union[TimeSeries, Sequence[TimeSeries]]] = None,
-    past_covariates: Optional[Union[TimeSeries, Sequence[TimeSeries]]] = None,
-    future_covariates: Optional[Union[TimeSeries, Sequence[TimeSeries]]] = None,
-    lags: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
-    lags_past_covariates: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
-    lags_future_covariates: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
+    target_series: TimeSeriesLike | None = None,
+    past_covariates: TimeSeriesLike | None = None,
+    future_covariates: TimeSeriesLike | None = None,
+    lags: Sequence[int] | dict[str, list[int]] | None = None,
+    lags_past_covariates: Sequence[int] | dict[str, list[int]] | None = None,
+    lags_future_covariates: Sequence[int] | dict[str, list[int]] | None = None,
     uses_static_covariates: bool = True,
-    last_static_covariates_shape: Optional[tuple[int, int]] = None,
-    max_samples_per_ts: Optional[int] = None,
+    last_static_covariates_shape: tuple[int, int] | None = None,
+    max_samples_per_ts: int | None = None,
     check_inputs: bool = True,
     use_moving_windows: bool = True,
     concatenate: bool = True,
@@ -708,19 +734,24 @@ def create_lagged_prediction_data(
 
 
 def add_static_covariates_to_lagged_data(
-    features: Union[np.ndarray, Sequence[np.ndarray]],
-    target_series: Union[TimeSeries, Sequence[TimeSeries]],
+    features: np.ndarray | Sequence[np.ndarray],
+    target_series: TimeSeriesLike,
     uses_static_covariates: bool = True,
-    last_shape: Optional[tuple[int, int]] = None,
-) -> Union[np.ndarray, Sequence[np.ndarray]]:
+    last_shape: tuple[int, int] | None = None,
+) -> np.ndarray | Sequence[np.ndarray]:
     """
     Add static covariates to the features' table for SKLearnModels.
     If `uses_static_covariates=True`, all target series used in `fit()` and `predict()` must have static
     covariates with identical dimensionality. Otherwise, will not consider static covariates.
 
     The static covariates are added to the right of the lagged features following the convention:
-    with a 2 component series, and 2 static covariates per component ->
-    scov_1_comp_1 | scov_1_comp_2 | scov_2_comp_1 | scov_2_comp_2
+    with a 2 component series, and 2 static covariates per component:
+
+    .. highlight:: md
+    .. code-block:: md
+
+        scov_1_comp_1 | scov_1_comp_2 | scov_2_comp_1 | scov_2_comp_2
+    ..
 
     Parameters
     ----------
@@ -797,12 +828,12 @@ def add_static_covariates_to_lagged_data(
 
 
 def create_lagged_component_names(
-    target_series: Optional[Union[TimeSeries, Sequence[TimeSeries]]] = None,
-    past_covariates: Optional[Union[TimeSeries, Sequence[TimeSeries]]] = None,
-    future_covariates: Optional[Union[TimeSeries, Sequence[TimeSeries]]] = None,
-    lags: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
-    lags_past_covariates: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
-    lags_future_covariates: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
+    target_series: TimeSeriesLike | None = None,
+    past_covariates: TimeSeriesLike | None = None,
+    future_covariates: TimeSeriesLike | None = None,
+    lags: Sequence[int] | dict[str, list[int]] | None = None,
+    lags_past_covariates: Sequence[int] | dict[str, list[int]] | None = None,
+    lags_future_covariates: Sequence[int] | dict[str, list[int]] | None = None,
     output_chunk_length: int = 1,
     concatenate: bool = True,
     use_static_covariates: bool = False,
@@ -812,41 +843,67 @@ def create_lagged_component_names(
     `create_lagged_data()`. The order of the features is the following:
 
     Along the `n_lagged_features` axis, `X` has the following structure:
+
+    .. highlight:: md
+    .. code-block:: md
+
         lagged_target | lagged_past_covariates | lagged_future_covariates | static covariates
+    ..
 
     For `*_lags=[-2,-1]` and `*_series.n_components = 2` (lags shared across all the components),
     each `lagged_*` has the following structure (grouped by lags):
+
+    .. highlight:: md
+    .. code-block:: md
+
         comp0_*_lag-2 | comp1_*_lag-2 | comp0_*_lag_-1 | comp1_*_lag-1
+    ..
+
     For `*_lags={'comp0':[-3, -1], 'comp1':[-5, -3]}` and `*_series.n_components = 2` (component-
     specific lags), each `lagged_*` has the following structure (sorted by lags, then by components):
+
+    .. highlight:: md
+    .. code-block:: md
+
         comp1_*_lag-5 | comp0_*_lag-3 | comp1_*_lag_-3 | comp0_*_lag-1
+    ..
 
     and for static covariates (2 static covariates acting on 2 target components):
+
+    .. highlight:: md
+    .. code-block:: md
+
         cov0_*_target_comp0 | cov0_*_target_comp1 | cov1_*_target_comp0 | cov1_*_target_comp1
+    ..
 
     Along the `n_lagged_labels` axis, `y` has the following structure (for `output_chunk_length=4` and
     `target_series.n_components=2`):
+
+    .. highlight:: md
+    .. code-block:: md
+
         comp0_target_lag0 | comp1_target_lag0 | ... | comp0_target_lag3 | comp1_target_lag3
+    ..
 
     Note : will only use the component names of the first series from `target_series`, `past_covariates`,
     `future_covariates`, and static_covariates.
 
     The naming convention for target, past and future covariates lags is: ``"{name}_{type}_lag{i}"``, where:
 
-        - ``{name}`` the component name of the (first) series
-        - ``{type}`` is the feature type, one of "target", "pastcov", and "futcov"
-        - ``{i}`` is the lag value
+    - ``{name}`` the component name of the (first) series
+    - ``{type}`` is the feature type, one of "target", "pastcov", and "futcov"
+    - ``{i}`` is the lag value
 
     The naming convention for static covariates is: ``"{name}_statcov_target_{comp}"``, where:
 
-        - ``{name}`` the static covariate name of the (first) series
-        - ``{comp}`` the target component name of the (first) that the static covariate act on. If the static
-            covariate acts globally on a multivariate target series, will show "global".
+    - ``{name}`` the static covariate name of the (first) series
+    - ``{comp}`` the target component name of the (first) that the static covariate act on. If the static
+      covariate acts globally on a multivariate target series, will show "global_components".
 
     The naming convention for labels is: ``"{name}_target_hrz{i}"``, where:
 
-        - ``{name}`` the component name of the (first) series
-        - ``{i}`` is the step in the forecast horizon
+    - ``{name}`` the component name of the (first) series
+    - ``{i}`` is the step in the forecast horizon
 
     Returns
     -------
@@ -975,24 +1032,24 @@ def _get_lagged_indices(
 
 
 def _create_lagged_data_by_moving_window(
-    target_series: Optional[TimeSeries],
+    target_series: TimeSeries | None,
     output_chunk_length: int,
     output_chunk_shift: int,
-    past_covariates: Optional[TimeSeries],
-    future_covariates: Optional[TimeSeries],
-    sample_weight: Optional[TimeSeries],
-    lags: Optional[Union[Sequence[int], dict[str, list[int]]]],
-    lags_past_covariates: Optional[Union[Sequence[int], dict[str, list[int]]]],
-    lags_future_covariates: Optional[Union[Sequence[int], dict[str, list[int]]]],
-    lags_extract: list[Optional[np.ndarray]],
-    lags_order: list[Optional[np.ndarray]],
-    max_samples_per_ts: Optional[int],
+    past_covariates: TimeSeries | None,
+    future_covariates: TimeSeries | None,
+    sample_weight: TimeSeries | None,
+    lags: Sequence[int] | dict[str, list[int]] | None,
+    lags_past_covariates: Sequence[int] | dict[str, list[int]] | None,
+    lags_future_covariates: Sequence[int] | dict[str, list[int]] | None,
+    lags_extract: list[np.ndarray | None],
+    lags_order: list[np.ndarray | None],
+    max_samples_per_ts: int | None,
     multi_models: bool,
     check_inputs: bool,
     is_training: bool,
     stride: int,
     show_warnings: bool = True,
-) -> tuple[np.ndarray, Optional[np.ndarray], pd.Index, Optional[np.ndarray]]:
+) -> tuple[np.ndarray, np.ndarray | None, pd.Index, np.ndarray | None]:
     """
     Helper function called by `create_lagged_data` that computes `X`, `y`, and `times` by
     extracting 'moving windows' from each series using the `strided_moving_window`
@@ -1160,7 +1217,7 @@ def _create_lagged_data_by_moving_window(
 
 def _extract_lagged_vals_from_windows(
     windows: np.ndarray,
-    lags_to_extract: Optional[Union[np.ndarray, list[np.ndarray]]] = None,
+    lags_to_extract: np.ndarray | list[np.ndarray] | None = None,
     lags_shift: int = 0,
 ) -> np.ndarray:
     """
@@ -1206,13 +1263,13 @@ def _create_lagged_data_by_intersecting_times(
     target_series: TimeSeries,
     output_chunk_length: int,
     output_chunk_shift: int,
-    past_covariates: Optional[TimeSeries],
-    future_covariates: Optional[TimeSeries],
-    sample_weight: Optional[TimeSeries],
-    lags: Optional[Sequence[int]],
-    lags_past_covariates: Optional[Sequence[int]],
-    lags_future_covariates: Optional[Sequence[int]],
-    max_samples_per_ts: Optional[int],
+    past_covariates: TimeSeries | None,
+    future_covariates: TimeSeries | None,
+    sample_weight: TimeSeries | None,
+    lags: Sequence[int] | None,
+    lags_past_covariates: Sequence[int] | None,
+    lags_future_covariates: Sequence[int] | None,
+    max_samples_per_ts: int | None,
     multi_models: bool,
     check_inputs: bool,
     is_training: bool,
@@ -1220,9 +1277,9 @@ def _create_lagged_data_by_intersecting_times(
     show_warnings: bool = True,
 ) -> tuple[
     np.ndarray,
-    Optional[np.ndarray],
-    Union[pd.RangeIndex, pd.DatetimeIndex],
-    Optional[np.ndarray],
+    np.ndarray | None,
+    pd.RangeIndex | pd.DatetimeIndex,
+    np.ndarray | None,
 ]:
     """
     Helper function called by `_create_lagged_data` that computes `X`, `y`, and `times` by
@@ -1297,7 +1354,9 @@ def _create_lagged_data_by_intersecting_times(
                 new_start = shared_times[0] if add_to_start else None
                 new_end = shared_times[-1] if add_to_end else None
                 num_prepended = (
-                    (time_index_i[0] - shared_times[0]) // series_i.freq
+                    n_steps_between(
+                        start=shared_times[0], end=time_index_i[0], freq=series_i.freq
+                    )
                     if add_to_start
                     else 0
                 )
@@ -1356,7 +1415,7 @@ def _create_lagged_data_by_intersecting_times(
 
 
 def _create_lagged_data_autoregression(
-    target_series: Union[TimeSeries, Sequence[TimeSeries]],
+    target_series: TimeSeriesLike,
     t_pred: int,
     shift: int,
     last_step_shift: int,
@@ -1366,7 +1425,7 @@ def _create_lagged_data_autoregression(
     component_lags: dict[str, dict[str, list[int]]],
     relative_cov_lags: dict[str, np.ndarray],
     uses_static_covariates: bool,
-    last_static_covariates_shape: Optional[tuple[int, int]],
+    last_static_covariates_shape: tuple[int, int] | None,
     num_samples: int,
 ) -> np.ndarray:
     """Extract lagged data from target, past covariates and future covariates for auto-regression
@@ -1471,28 +1530,28 @@ def _extract_component_lags_autoregression(
 
 # For convenience, define following types for `_get_feature_times`:
 FeatureTimes = tuple[
-    Optional[Union[pd.Index, pd.DatetimeIndex, pd.RangeIndex]],
-    Optional[Union[pd.Index, pd.DatetimeIndex, pd.RangeIndex]],
-    Optional[Union[pd.Index, pd.DatetimeIndex, pd.RangeIndex]],
+    pd.Index | TimeIndex | None,
+    pd.Index | TimeIndex | None,
+    pd.Index | TimeIndex | None,
 ]
-MinLags = tuple[Optional[int], Optional[int], Optional[int]]
-MaxLags = tuple[Optional[int], Optional[int], Optional[int]]
+MinLags = tuple[int | None, int | None, int | None]
+MaxLags = tuple[int | None, int | None, int | None]
 
 
 def _get_feature_times(
-    target_series: Optional[TimeSeries] = None,
-    past_covariates: Optional[TimeSeries] = None,
-    future_covariates: Optional[TimeSeries] = None,
-    lags: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
-    lags_past_covariates: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
-    lags_future_covariates: Optional[Union[Sequence[int], dict[str, list[int]]]] = None,
+    target_series: TimeSeries | None = None,
+    past_covariates: TimeSeries | None = None,
+    future_covariates: TimeSeries | None = None,
+    lags: Sequence[int] | dict[str, list[int]] | None = None,
+    lags_past_covariates: Sequence[int] | dict[str, list[int]] | None = None,
+    lags_future_covariates: Sequence[int] | dict[str, list[int]] | None = None,
     output_chunk_length: int = 1,
     output_chunk_shift: int = 0,
     is_training: bool = True,
     return_min_and_max_lags: bool = False,
     check_inputs: bool = True,
     show_warnings: bool = True,
-) -> Union[FeatureTimes, tuple[FeatureTimes, MinLags, MaxLags]]:
+) -> FeatureTimes | tuple[FeatureTimes, MinLags, MaxLags]:
     """
     Returns a tuple containing the times in `target_series`, the times in `past_covariates`, and the times in
     `future_covariates` that *could* be used to create features. The returned tuple of times can then be passed
@@ -1707,19 +1766,16 @@ def _get_feature_times(
             # `target_series`/`past_covariates` in `Notes`:
             if max_lag_i > 0:
                 times_i = times_i[max_lag_i:]
-        elif (
-            show_warnings
-            and (not is_label_series)
-            and (series_specified ^ lags_specified)
-        ):
+        elif (not is_label_series) and (series_specified ^ lags_specified):
             # Warn user that series/lags input will be ignored:
             times_i = max_lag_i = None
             lags_name = "lags" if name_i == "target_series" else f"lags_{name_i}"
             specified = lags_name if lags_specified else name_i
             unspecified = name_i if lags_specified else lags_name
-            warnings.warn(
-                f"`{specified}` was specified without accompanying `{unspecified}` and, thus, will be ignored."
-            )
+            if show_warnings:
+                warnings.warn(
+                    f"`{specified}` was specified without accompanying `{unspecified}` and, thus, will be ignored."
+                )
 
         feature_times.append(times_i)
         # Note `max_lag_i` and `min_lag_i` if requested:
@@ -1737,7 +1793,7 @@ def _get_feature_times(
 
 
 def get_shared_times(
-    *series_or_times: Union[TimeSeries, pd.Index, None], sort: bool = True
+    *series_or_times: TimeSeries | pd.Index | None, sort: bool = True
 ) -> pd.Index:
     """
     Returns the times shared by all specified `TimeSeries` or time indexes (i.e. the intersection of all
@@ -1811,8 +1867,8 @@ def get_shared_times(
 
 
 def get_shared_times_bounds(
-    *series_or_times: Sequence[Union[TimeSeries, pd.Index, None]],
-) -> Union[tuple[pd.Index, pd.Index], None]:
+    *series_or_times: Sequence[TimeSeries | pd.Index | None],
+) -> tuple[pd.Index, pd.Index] | None:
     """
     Returns the latest `start_time` and the earliest `end_time` among all non-`None` `series_or_times`;
     these are (non-tight) lower and upper `bounds` on the intersection of all these `series_or_times` respectively.
@@ -1824,16 +1880,28 @@ def get_shared_times_bounds(
     returns tight `bounds` (i.e. the earliest and latest time within the intersection of all the timeseries
     is returned). To see this, suppose we have three equal-frequency series with observations made at different
     times:
+
+    .. highlight:: md
+    .. code-block:: md
+
         Series 1: ------
         Series 2:    ------
         Series 3:  ------
+    ..
+
     Here, each `-` denotes an observation at a specific time. In this example, `find_time_overlap_bounds` will
     return the times at `LB` and `UB`:
+
+    .. highlight:: md
+    .. code-block:: md
+
                     LB
         Series 1: ---|---|
         Series 2:    |---|---
         Series 3:  --|---|-
                          UB
+    ..
+
     If the specified timeseries are *not* of the same frequency, then the returned `bounds` is potentially non-tight
     (i.e. `LB <= intersection.start_time() < intersection.end_time() <= UB`, where `intersection` are the times shared
     by all specified timeseries)
@@ -1856,7 +1924,6 @@ def get_shared_times_bounds(
     TypeError
         If the series and/or times in `series_or_times` don't all share the same type of `time_index`
         (i.e. either all `pd.DatetimeIndex` or `pd.RangeIndex`).
-
     """
     start_times, end_times = [], []
     for val in series_or_times:
@@ -1901,10 +1968,12 @@ def strided_moving_window(
     Notes
     -----
     This function is similar to `sliding_window_view` in `np.lib.stride_tricks`, except that:
-        1. `strided_moving_window` allows for consecutive windows to be separated by a specified `stride`,
-        whilst `sliding_window_view` does not.
-        2. `strided_moving_window` can only operate along a single axis, whereas `sliding_window_view` can
-        operate along multiple axes.
+
+    - `strided_moving_window` allows for consecutive windows to be separated by a specified `stride`,
+      whilst `sliding_window_view` does not.
+    - `strided_moving_window` can only operate along a single axis, whereas `sliding_window_view` can
+      operate along multiple axes.
+
     Additionally, unlike `sliding_window_view`, using `strided_moving_window` doesn't require `numpy >= 1.20.0`.
 
     Parameters
@@ -1979,9 +2048,9 @@ def strided_moving_window(
 
 def _extend_time_index(
     time_index: pd.Index,
-    freq: Union[int, str],
-    new_start: Optional[pd.Timestamp] = None,
-    new_end: Optional[pd.Timestamp] = None,
+    freq: int | str,
+    new_start: pd.Timestamp | None = None,
+    new_end: pd.Timestamp | None = None,
 ):
     """
     Extends a `time_index` of frequency `freq` such that it now ends at time `new_end`;
@@ -1999,7 +2068,7 @@ def _extend_time_index(
     return time_index
 
 
-def _get_freqs(*series: Union[TimeSeries, None]):
+def _get_freqs(*series: TimeSeries | None):
     """
     Returns list with the frequency of all specified (i.e. non-`None`) `series`.
     """
@@ -2010,7 +2079,7 @@ def _get_freqs(*series: Union[TimeSeries, None]):
     return freqs
 
 
-def _all_equal_freq(*series: Union[TimeSeries, None]) -> bool:
+def _all_equal_freq(*series: TimeSeries | None) -> bool:
     """
     Returns `True` if all specified (i.e. non-`None`) `series` have the same frequency.
     """
@@ -2019,9 +2088,9 @@ def _all_equal_freq(*series: Union[TimeSeries, None]) -> bool:
 
 
 def _check_lags(
-    lags: Optional[Union[Sequence[int], dict[str, list[int]]]],
-    lags_past_covariates: Optional[Union[Sequence[int], dict[str, list[int]]]],
-    lags_future_covariates: Optional[Union[Sequence[int], dict[str, list[int]]]],
+    lags: Sequence[int] | dict[str, list[int]] | None,
+    lags_past_covariates: Sequence[int] | dict[str, list[int]] | None,
+    lags_future_covariates: Sequence[int] | dict[str, list[int]] | None,
 ) -> None:
     """
     Throws `ValueError` if any `lag` values aren't negative OR if no lags have been specified.
@@ -2059,7 +2128,7 @@ def _check_lags(
 
 def _check_series_length(
     series: TimeSeries,
-    lags: Union[None, Sequence[int]],
+    lags: None | Sequence[int],
     output_chunk_length: int,
     output_chunk_shift: int,
     is_training: bool,

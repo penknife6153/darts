@@ -21,17 +21,17 @@ Optionally, ``TimeSeries`` can store static covariates, a hierarchy, and / or me
 
 - **Static covariates** are time-invariant external data / information about the series and can be used by some models
   to help improve predictions. Find more info on covariates `here
-  <https://unit8co.github.io/darts/userguide/covariates.html>`_.
+  <https://unit8co.github.io/darts/userguide/covariates.html>`__.
 - A **hierarchy** describes the hierarchical structure of the components which can be used to reconcile forecasts. For
   more info on hierarchical reconciliation `here
-  <https://unit8co.github.io/darts/examples/16-hierarchical-reconciliation.html>`_.
+  <https://unit8co.github.io/darts/examples/16-hierarchical-reconciliation.html>`__.
 - **Metadata** can be used to store any additional information about the series which will not be used by any model.
 
 ``TimeSeries`` **are guaranteed to:**
 
 - Have a strictly monotonically increasing time index with a well-defined frequency (without holes / missing dates).
   For more info on available ``DateTimeIndex`` frequencies, see `date offset aliases
-  <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`_. For integer-indexed
+  <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__. For integer-indexed
   series the frequency corresponds to the constant step size between consecutive indices.
 - Contain numeric data types only
 - Have unique component / column names
@@ -39,36 +39,44 @@ Optionally, ``TimeSeries`` can store static covariates, a hierarchy, and / or me
 - Have a hierarchy consistent with their components, or no hierarchy
 """
 
-import contextlib
+from __future__ import annotations
+
 import itertools
+import json
+import math
 import pickle
 import re
 import sys
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from inspect import signature
 from io import StringIO
 from types import ModuleType
-from typing import Any, Callable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Literal
 
-import matplotlib.axes
-import matplotlib.pyplot as plt
 import narwhals as nw
 import numpy as np
 import pandas as pd
-import xarray as xr
-from narwhals.typing import IntoDataFrame, IntoSeries
 from narwhals.utils import Implementation
 from pandas.tseries.frequencies import to_offset
-from scipy.stats import kurtosis, skew
 
+from darts.config import get_option
 from darts.logging import get_logger, raise_log
+from darts.typing import TimeIndex, TimeZone
 from darts.utils import _build_tqdm_iterator, _parallel_apply
+from darts.utils._formatting import (
+    format_bytes,
+    format_dict,
+    make_collapsible_section,
+    make_paragraph,
+)
 from darts.utils.utils import (
     SUPPORTED_RESAMPLE_METHODS,
+    dataframe_col_to_time_index,
     expand_arr,
     generate_index,
+    infer_freq_intersection,
     n_steps_between,
 )
 
@@ -76,6 +84,11 @@ if sys.version_info >= (3, 11):
     from typing import Self
 else:
     from typing_extensions import Self
+
+if TYPE_CHECKING:
+    import matplotlib.axes
+    import plotly.graph_objects as go
+    import xarray as xr
 
 logger = get_logger(__name__)
 
@@ -87,7 +100,6 @@ COMP_AX = 1
 SMPL_AX = 2
 AXES = {"time": TIME_AX, "component": COMP_AX, "sample": SMPL_AX}
 
-VALID_INDEX_TYPES = (pd.DatetimeIndex, pd.RangeIndex)
 STATIC_COV_TAG = "static_covariates"
 DEFAULT_GLOBAL_STATIC_COV_NAME = "global_components"
 HIERARCHY_TAG = "hierarchy"
@@ -97,15 +109,15 @@ METADATA_TAG = "metadata"
 class TimeSeries:
     def __init__(
         self,
-        times: Union[pd.DatetimeIndex, pd.RangeIndex, pd.Index],
+        times: TimeIndex | pd.Index,
         values: np.ndarray,
-        fill_missing_dates: Optional[bool] = False,
-        freq: Optional[Union[str, int]] = None,
-        components: Optional[pd._typing.Axes] = None,
-        fillna_value: Optional[float] = None,
-        static_covariates: Optional[Union[pd.Series, pd.DataFrame]] = None,
-        hierarchy: Optional[dict] = None,
-        metadata: Optional[dict] = None,
+        fill_missing_dates: bool | None = False,
+        freq: str | int | None = None,
+        components: Sequence | str | None = None,
+        fillna_value: float | None = None,
+        static_covariates: pd.Series | pd.DataFrame | None = None,
+        hierarchy: dict | None = None,
+        metadata: dict | None = None,
         copy: bool = True,
     ):
         """Create a ``TimeSeries`` from a time index `times` and values `values`.
@@ -142,7 +154,7 @@ class TimeSeries:
             Optionally, a string or integer representing the frequency of the underlying index. This is useful in order
             to fill in missing values if some dates are missing and `fill_missing_dates` is set to `True`.
             If a string, represents the frequency of the pandas DatetimeIndex (see `offset aliases
-            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`_ for more info on
+            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__ for more info on
             supported frequencies).
             If an integer, represents the step size of the pandas Index or pandas RangeIndex.
         components
@@ -178,9 +190,10 @@ class TimeSeries:
                     "r2": ["total"]
                 }
             ..
+
             The hierarchy can be used to reconcile forecasts (so that the sums of the forecasts at
             different levels are consistent), see `hierarchical reconciliation
-            <https://unit8co.github.io/darts/generated_api/darts.dataprocessing.transformers.reconciliation.html>`_.
+            <https://unit8co.github.io/darts/generated_api/darts.dataprocessing.transformers.reconciliation.html>`__.
         metadata
             Optionally, a dictionary with metadata to be added to the TimeSeries.
         copy
@@ -204,10 +217,7 @@ class TimeSeries:
         >>> series.shape
         (3, 1, 1)
         """
-        if not (
-            isinstance(times, VALID_INDEX_TYPES)
-            or np.issubdtype(times.dtype, np.integer)
-        ):
+        if not (isinstance(times, TimeIndex) or np.issubdtype(times.dtype, np.integer)):
             raise_log(
                 ValueError(
                     "the `times` argument must be a `pandas.RangeIndex`, or `pandas.DateTimeIndex`. Use "
@@ -345,10 +355,10 @@ class TimeSeries:
                     logger,
                 )
 
-            freq_str: Optional[str] = freq.freqstr
+            freq_str: str | None = freq.freqstr
         else:
             freq: int = times.step
-            freq_str = None
+            freq_str = str(freq)
 
         # how the dimensions are named; we convert hashable to string
         self._time_dim = str(times.name) if times.name is not None else DIMS[TIME_AX]
@@ -361,7 +371,7 @@ class TimeSeries:
 
         # check static covariates
         if not (
-            isinstance(static_covariates, (pd.Series, pd.DataFrame))
+            isinstance(static_covariates, pd.Series | pd.DataFrame)
             or static_covariates is None
         ):
             raise_log(
@@ -405,9 +415,9 @@ class TimeSeries:
 
             # Calling astype is costly even when there's no change...
             if not cols_to_cast.empty:
-                static_covariates = static_covariates.astype(
-                    {col: self.dtype for col in cols_to_cast}, copy=False
-                )
+                static_covariates = static_covariates.astype({
+                    col: self.dtype for col in cols_to_cast
+                })
 
         # prepare metadata
         if metadata is not None and not isinstance(metadata, dict):
@@ -495,9 +505,9 @@ class TimeSeries:
     def from_xarray(
         cls,
         xa: xr.DataArray,
-        fill_missing_dates: Optional[bool] = False,
-        freq: Optional[Union[str, int]] = None,
-        fillna_value: Optional[float] = None,
+        fill_missing_dates: bool | None = False,
+        freq: str | int | None = None,
+        fillna_value: float | None = None,
         copy: bool = True,
     ) -> Self:
         """Create a ``TimeSeries`` from an `xarray.DataArray`.
@@ -528,7 +538,7 @@ class TimeSeries:
             Optionally, a string or integer representing the frequency of the underlying index. This is useful in order
             to fill in missing values if some dates are missing and `fill_missing_dates` is set to `True`.
             If a string, represents the frequency of the pandas DatetimeIndex (see `offset aliases
-            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`_ for more info on
+            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__ for more info on
             supported frequencies).
             If an integer, represents the step size of the pandas Index or pandas RangeIndex.
         fillna_value
@@ -584,14 +594,14 @@ class TimeSeries:
     def from_csv(
         cls,
         filepath_or_buffer,
-        time_col: Optional[str] = None,
-        value_cols: Optional[Union[list[str], str]] = None,
-        fill_missing_dates: Optional[bool] = False,
-        freq: Optional[Union[str, int]] = None,
-        fillna_value: Optional[float] = None,
-        static_covariates: Optional[Union[pd.Series, pd.DataFrame]] = None,
-        hierarchy: Optional[dict] = None,
-        metadata: Optional[dict] = None,
+        time_col: str | None = None,
+        value_cols: list[str] | str | None = None,
+        fill_missing_dates: bool | None = False,
+        freq: str | int | None = None,
+        fillna_value: float | None = None,
+        static_covariates: pd.Series | pd.DataFrame | None = None,
+        hierarchy: dict | None = None,
+        metadata: dict | None = None,
         **kwargs,
     ) -> Self:
         """Create a ``TimeSeries`` from a CSV file.
@@ -618,7 +628,7 @@ class TimeSeries:
             Optionally, a string or integer representing the frequency of the underlying index. This is useful in order
             to fill in missing values if some dates are missing and `fill_missing_dates` is set to `True`.
             If a string, represents the frequency of the pandas DatetimeIndex (see `offset aliases
-            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`_ for more info on
+            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__ for more info on
             supported frequencies).
             If an integer, represents the step size of the pandas Index or pandas RangeIndex.
         fillna_value
@@ -652,9 +662,10 @@ class TimeSeries:
                     "r2": ["total"]
                 }
             ..
+
             The hierarchy can be used to reconcile forecasts (so that the sums of the forecasts at
             different levels are consistent), see `hierarchical reconciliation
-            <https://unit8co.github.io/darts/generated_api/darts.dataprocessing.transformers.reconciliation.html>`_.
+            <https://unit8co.github.io/darts/generated_api/darts.dataprocessing.transformers.reconciliation.html>`__.
         metadata
             Optionally, a dictionary with metadata to be added to the TimeSeries.
 
@@ -687,15 +698,15 @@ class TimeSeries:
     @classmethod
     def from_dataframe(
         cls,
-        df: IntoDataFrame,
-        time_col: Optional[str] = None,
-        value_cols: Optional[Union[list[str], str]] = None,
-        fill_missing_dates: Optional[bool] = False,
-        freq: Optional[Union[str, int]] = None,
-        fillna_value: Optional[float] = None,
-        static_covariates: Optional[Union[pd.Series, pd.DataFrame]] = None,
-        hierarchy: Optional[dict] = None,
-        metadata: Optional[dict] = None,
+        df,
+        time_col: str | None = None,
+        value_cols: list[str] | str | None = None,
+        fill_missing_dates: bool | None = False,
+        freq: str | int | None = None,
+        fillna_value: float | None = None,
+        static_covariates: pd.Series | pd.DataFrame | None = None,
+        hierarchy: dict | None = None,
+        metadata: dict | None = None,
         copy: bool = True,
     ) -> Self:
         """Create a ``TimeSeries`` from a selection of columns of a `DataFrame`.
@@ -708,7 +719,7 @@ class TimeSeries:
         df
             The DataFrame, or anything which can be converted to a narwhals DataFrame (e.g. pandas.DataFrame,
             polars.DataFrame, ...). See the `narwhals documentation
-            <https://narwhals-dev.github.io/narwhals/api-reference/narwhals/#narwhals.from_native>`_ for more
+            <https://narwhals-dev.github.io/narwhals/api-reference/narwhals/#narwhals.from_native>`__ for more
             information.
         time_col
             The time column name. If set, the column will be cast to a pandas DatetimeIndex (if it contains
@@ -729,7 +740,7 @@ class TimeSeries:
             Optionally, a string or integer representing the frequency of the underlying index. This is useful in order
             to fill in missing values if some dates are missing and `fill_missing_dates` is set to `True`.
             If a string, represents the frequency of the pandas DatetimeIndex (see `offset aliases
-            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`_ for more info on
+            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__ for more info on
             supported frequencies).
             If an integer, represents the step size of the pandas Index or pandas RangeIndex.
         fillna_value
@@ -763,9 +774,10 @@ class TimeSeries:
                     "r2": ["total"]
                 }
             ..
+
             The hierarchy can be used to reconcile forecasts (so that the sums of the forecasts at
             different levels are consistent), see `hierarchical reconciliation
-            <https://unit8co.github.io/darts/generated_api/darts.dataprocessing.transformers.reconciliation.html>`_.
+            <https://unit8co.github.io/darts/generated_api/darts.dataprocessing.transformers.reconciliation.html>`__.
         metadata
             Optionally, a dictionary with metadata to be added to the TimeSeries.
         copy
@@ -801,69 +813,9 @@ class TimeSeries:
         """
         df = nw.from_native(df, eager_only=True, pass_through=False)
 
-        # get values
-        if value_cols is None:
-            series_df = df.drop(time_col) if time_col else df
-        else:
-            if isinstance(value_cols, (str, int)):
-                value_cols = [value_cols]
-            series_df = df[value_cols]
-
         # get time index
         if time_col:
-            if time_col not in df.columns:
-                raise_log(AttributeError(f"time_col='{time_col}' is not present."))
-
-            time_col_vals = df.get_column(time_col)
-
-            if time_col_vals.dtype == nw.String:
-                # Try to convert to integers if needed
-                with contextlib.suppress(Exception):
-                    time_col_vals = time_col_vals.cast(nw.Int64)
-
-            if time_col_vals.dtype.is_integer():
-                if time_col_vals.is_duplicated().any():
-                    raise_log(
-                        ValueError(
-                            "The provided integer time index column contains duplicate values."
-                        )
-                    )
-                # Temporarily use an integer `pd.Index` to sort the values; later replaced with
-                # a `pd.RangeIndex` in `__init__()`
-                time_index = pd.Index(time_col_vals)
-
-            elif isinstance(time_col_vals.dtype, nw.String):
-                # The integer conversion failed; try datetimes
-                try:
-                    time_index = pd.DatetimeIndex(time_col_vals)
-                except ValueError:
-                    raise_log(
-                        AttributeError(
-                            "'time_col' is of 'String' dtype but doesn't contain valid timestamps"
-                        )
-                    )
-            elif isinstance(time_col_vals.dtype, nw.Datetime):
-                # force time index to be timezone naive, as polars converts to UTC
-                time_zone = time_col_vals.dtype.time_zone
-                if time_zone is not None:
-                    logger.warning(
-                        "The provided DatetimeIndex was associated with a timezone (tz), which is currently not "
-                        "supported. To avoid unexpected behaviour, the tz information was removed. Consider calling "
-                        f"`ts.time_index.tz_localize({time_zone})` when exporting the results."
-                        "To plot the series with the right time steps, consider setting the matplotlib.pyplot "
-                        "`rcParams['timezone']` parameter to automatically convert the time axis back to the "
-                        "original timezone."
-                    )
-                    time_col_vals = time_col_vals.dt.replace_time_zone(None)
-                time_index = pd.DatetimeIndex(time_col_vals)
-            else:
-                raise_log(
-                    AttributeError(
-                        "Invalid type of `time_col`: it needs to be of either 'String', 'Datetime' or 'Int' dtype."
-                    )
-                )
-            if not time_index.name:
-                time_index.name = time_col
+            time_index = dataframe_col_to_time_index(df, time_col)
         else:
             time_index = nw.maybe_get_index(df)
             if time_index is None:
@@ -873,9 +825,9 @@ class TimeSeries:
                     "`pandas.RangeIndex(len(df))`. If this is not desired consider adding a time column "
                     "to your `DataFrame` and defining `time_col`."
                 )
-            # if we are here, the dataframe was pandas
+            # if we are here, the DataFrame was pandas
             elif not (
-                isinstance(time_index, VALID_INDEX_TYPES)
+                isinstance(time_index, TimeIndex)
                 or np.issubdtype(time_index.dtype, np.integer)
             ):
                 raise_log(
@@ -885,6 +837,14 @@ class TimeSeries:
                     ),
                     logger,
                 )
+
+        # get values
+        if value_cols is None:
+            series_df = df.drop(time_col) if time_col else df
+        else:
+            if isinstance(value_cols, str | int):
+                value_cols = [value_cols]
+            series_df = df[value_cols]
 
         return cls(
             times=time_index,
@@ -902,18 +862,18 @@ class TimeSeries:
     @classmethod
     def from_group_dataframe(
         cls,
-        df: pd.DataFrame,
-        group_cols: Union[list[str], str],
-        time_col: Optional[str] = None,
-        value_cols: Optional[Union[list[str], str]] = None,
-        static_cols: Optional[Union[list[str], str]] = None,
-        metadata_cols: Optional[Union[list[str], str]] = None,
-        fill_missing_dates: Optional[bool] = False,
-        freq: Optional[Union[str, int]] = None,
-        fillna_value: Optional[float] = None,
-        drop_group_cols: Optional[Union[list[str], str]] = None,
-        n_jobs: Optional[int] = 1,
-        verbose: Optional[bool] = False,
+        df,
+        group_cols: list[str] | str,
+        time_col: str | None = None,
+        value_cols: list[str] | str | None = None,
+        static_cols: list[str] | str | None = None,
+        metadata_cols: list[str] | str | None = None,
+        fill_missing_dates: bool | None = False,
+        freq: str | int | None = None,
+        fillna_value: float | None = None,
+        drop_group_cols: list[str] | str | None = None,
+        n_jobs: int | None = 1,
+        verbose: bool | None = False,
         copy: bool = True,
     ) -> list[Self]:
         """Create a list of ``TimeSeries`` grouped by a selection of columns from a `DataFrame`.
@@ -928,7 +888,10 @@ class TimeSeries:
         Parameters
         ----------
         df
-            The DataFrame
+            The DataFrame, or anything which can be converted to a narwhals DataFrame (e.g. pandas.DataFrame,
+            polars.DataFrame, ...). See the `narwhals documentation
+            <https://narwhals-dev.github.io/narwhals/api-reference/narwhals/#narwhals.from_native>`__ for more
+            information.
         group_cols
             A string or list of strings representing the columns from the DataFrame by which to extract the
             individual TimeSeries groups.
@@ -961,7 +924,7 @@ class TimeSeries:
             Optionally, a string or integer representing the frequency of the underlying index. This is useful in order
             to fill in missing values if some dates are missing and `fill_missing_dates` is set to `True`.
             If a string, represents the frequency of the pandas DatetimeIndex (see `offset aliases
-            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`_ for more info on
+            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__ for more info on
             supported frequencies).
             If an integer, represents the step size of the pandas Index or pandas RangeIndex.
         fillna_value
@@ -1012,11 +975,31 @@ class TimeSeries:
         >>> len(series_multi), series_multi[0].shape, series_multi[1].shape
         (2, (3, 1, 1), (6, 1, 1))
         """
-        if time_col is None and df.index.is_monotonic_increasing:
+        df = nw.from_native(df, eager_only=True, pass_through=False)
+        if time_col is None:
+            if not df.implementation.is_pandas():
+                raise_log(
+                    ValueError(
+                        "`time_col` is required when `df` is not a `pandas.DataFrame`."
+                    ),
+                    logger=logger,
+                )
+            is_sorted = nw.maybe_get_index(df).is_monotonic_increasing
+        else:
+            is_sorted = df.get_column(time_col).is_sorted()
+
+            if df.implementation.is_pandas():
+                # with pandas we can get a performance boost by converting the time_col to index
+                time_index = dataframe_col_to_time_index(df, time_col)
+                df: pd.DataFrame = df.drop(time_col).to_native().set_index(time_index)
+                df = nw.from_native(df)
+                time_col = None
+
+        if is_sorted:
             logger.warning(
-                "UserWarning: `time_col` was not set and `df` has a monotonically increasing (time) index. This "
-                "results in time series groups with non-overlapping (time) index. You can ignore this warning if the "
-                "index represents the actual index of each individual time series group."
+                "UserWarning: The (time) index from `df` is monotonically increasing. This may "
+                "result in time series groups with non-overlapping (time) index. You can ignore this "
+                "warning if the index represents the actual index of each individual time series group."
             )
 
         # group cols: used to extract time series groups from `df`, will also be added as static covariates
@@ -1074,9 +1057,12 @@ class TimeSeries:
         extract_time_col = [] if time_col is None else [time_col]
 
         if value_cols is None:
-            value_cols = df.columns.drop(
-                static_cov_cols + extract_metadata_cols + extract_time_col
-            ).tolist()
+            value_cols = [
+                col
+                for col in df.columns
+                if col
+                not in set(static_cov_cols + extract_metadata_cols + extract_time_col)
+            ]
         extract_value_cols = [value_cols] if isinstance(value_cols, str) else value_cols
 
         df = df[
@@ -1086,44 +1072,29 @@ class TimeSeries:
             + extract_metadata_cols
         ]
 
-        if time_col:
-            if np.issubdtype(df[time_col].dtype, object) or np.issubdtype(
-                df[time_col].dtype, np.datetime64
-            ):
-                df.index = pd.DatetimeIndex(df[time_col])
-                df = df.drop(columns=time_col)
-            else:
-                df = df.set_index(time_col)
+        groups = df.group_by(group_cols[0] if len(group_cols) == 1 else group_cols)
 
-        if df.index.is_monotonic_increasing:
-            logger.warning(
-                "UserWarning: The (time) index from `df` is monotonically increasing. This "
-                "results in time series groups with non-overlapping (time) index. You can ignore this warning if the "
-                "index represents the actual index of each individual time series group."
-            )
-
-        # sort on entire `df` to avoid having to sort individually later on
-        else:
-            df = df.sort_index()
-
-        groups = df.groupby(group_cols[0] if len(group_cols) == 1 else group_cols)
+        # not all backends maintain the order when grouping; need to sort the groups in the end for reproducibility
+        unique_groups = df[group_cols].unique().sort(by=group_cols).to_numpy()
+        sorted_group_idx = {
+            tuple(group_): idx for idx, group_ in enumerate(unique_groups)
+        }
 
         # build progress bar for iterator
         iterator = _build_tqdm_iterator(
             groups,
             verbose=verbose,
-            total=len(groups),
+            total=len(unique_groups),
             desc="Creating TimeSeries",
         )
 
         def from_group(static_cov_vals, group):
-            split = group[extract_value_cols]
-
             static_cov_vals = (
                 (static_cov_vals,)
                 if not isinstance(static_cov_vals, tuple)
                 else static_cov_vals
             )
+            group_idx = static_cov_vals
             # optionally, exclude group columns from static covariates
             if drop_group_col_idx:
                 if len(drop_group_col_idx) == len(group_cols):
@@ -1137,31 +1108,36 @@ class TimeSeries:
 
             if static_cols:
                 # use first value as static covariate (assume only one unique per group)
-                static_cov_vals += tuple(group[static_cols].values[0])
+                static_cov_vals += group[static_cols].row(0)
 
             metadata = None
             if metadata_cols:
                 # use first value as metadata (assume only one unique per group)
                 metadata = {
                     col: val
-                    for col, val in zip(metadata_cols, group[metadata_cols].values[0])
+                    for col, val in zip(metadata_cols, group[metadata_cols].row(0))
                 }
 
-            return cls.from_dataframe(
-                df=split,
-                fill_missing_dates=fill_missing_dates,
-                freq=freq,
-                fillna_value=fillna_value,
-                static_covariates=(
-                    pd.DataFrame([static_cov_vals], columns=extract_static_cov_cols)
-                    if extract_static_cov_cols
-                    else None
+            return (
+                group_idx,
+                cls.from_dataframe(
+                    df=group,
+                    time_col=time_col,
+                    value_cols=extract_value_cols,
+                    fill_missing_dates=fill_missing_dates,
+                    freq=freq,
+                    fillna_value=fillna_value,
+                    static_covariates=(
+                        pd.DataFrame([static_cov_vals], columns=extract_static_cov_cols)
+                        if extract_static_cov_cols
+                        else None
+                    ),
+                    metadata=metadata,
+                    copy=copy,
                 ),
-                metadata=metadata,
-                copy=copy,
             )
 
-        return _parallel_apply(
+        series_groups = _parallel_apply(
             iterator,
             from_group,
             n_jobs,
@@ -1169,15 +1145,21 @@ class TimeSeries:
             fn_kwargs=dict(),
         )
 
+        # re-order series to get reproducible results
+        series = [None] * len(sorted_group_idx)
+        for group_i, series_group in series_groups:
+            series[sorted_group_idx[group_i]] = series_group
+        return series
+
     @classmethod
     def from_series(
         cls,
-        pd_series: IntoSeries,
-        fill_missing_dates: Optional[bool] = False,
-        freq: Optional[Union[str, int]] = None,
-        fillna_value: Optional[float] = None,
-        static_covariates: Optional[Union[pd.Series, pd.DataFrame]] = None,
-        metadata: Optional[dict] = None,
+        pd_series,
+        fill_missing_dates: bool | None = False,
+        freq: str | int | None = None,
+        fillna_value: float | None = None,
+        static_covariates: pd.Series | pd.DataFrame | None = None,
+        metadata: dict | None = None,
         copy: bool = True,
     ) -> Self:
         """Create a ``TimeSeries`` from a `Series`.
@@ -1192,7 +1174,7 @@ class TimeSeries:
         pd_series
             The Series, or anything which can be converted to a narwhals Series (e.g. pandas.Series, ...). See the
             `narwhals documentation
-            <https://narwhals-dev.github.io/narwhals/api-reference/narwhals/#narwhals.from_native>`_ for more
+            <https://narwhals-dev.github.io/narwhals/api-reference/narwhals/#narwhals.from_native>`__ for more
             information.
         fill_missing_dates
             Optionally, a boolean value indicating whether to fill missing dates (or indices in case of integer index)
@@ -1202,7 +1184,7 @@ class TimeSeries:
             Optionally, a string or integer representing the frequency of the underlying index. This is useful in order
             to fill in missing values if some dates are missing and `fill_missing_dates` is set to `True`.
             If a string, represents the frequency of the pandas DatetimeIndex (see `offset aliases
-            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`_ for more info on
+            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__ for more info on
             supported frequencies).
             If an integer, represents the step size of the pandas Index or pandas RangeIndex.
         fillna_value
@@ -1253,15 +1235,15 @@ class TimeSeries:
     @classmethod
     def from_times_and_values(
         cls,
-        times: Union[pd.DatetimeIndex, pd.RangeIndex, pd.Index],
+        times: TimeIndex | pd.Index,
         values: np.ndarray,
-        fill_missing_dates: Optional[bool] = False,
-        freq: Optional[Union[str, int]] = None,
-        columns: Optional[pd._typing.Axes] = None,
-        fillna_value: Optional[float] = None,
-        static_covariates: Optional[Union[pd.Series, pd.DataFrame]] = None,
-        hierarchy: Optional[dict] = None,
-        metadata: Optional[dict] = None,
+        fill_missing_dates: bool | None = False,
+        freq: str | int | None = None,
+        columns: Sequence | str | None = None,
+        fillna_value: float | None = None,
+        static_covariates: pd.Series | pd.DataFrame | None = None,
+        hierarchy: dict | None = None,
+        metadata: dict | None = None,
         copy: bool = True,
     ) -> Self:
         """Create a ``TimeSeries`` from a time index and value array.
@@ -1285,7 +1267,7 @@ class TimeSeries:
             Optionally, a string or integer representing the frequency of the underlying index. This is useful in order
             to fill in missing values if some dates are missing and `fill_missing_dates` is set to `True`.
             If a string, represents the frequency of the pandas DatetimeIndex (see `offset aliases
-            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`_ for more info on
+            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__ for more info on
             supported frequencies).
             If an integer, represents the step size of the pandas Index or pandas RangeIndex.
         columns
@@ -1321,9 +1303,10 @@ class TimeSeries:
                     "r2": ["total"]
                 }
             ..
+
             The hierarchy can be used to reconcile forecasts (so that the sums of the forecasts at
             different levels are consistent), see `hierarchical reconciliation
-            <https://unit8co.github.io/darts/generated_api/darts.dataprocessing.transformers.reconciliation.html>`_.
+            <https://unit8co.github.io/darts/generated_api/darts.dataprocessing.transformers.reconciliation.html>`__.
         metadata
             Optionally, a dictionary with metadata to be added to the TimeSeries.
         copy
@@ -1364,11 +1347,11 @@ class TimeSeries:
     def from_values(
         cls,
         values: np.ndarray,
-        columns: Optional[pd._typing.Axes] = None,
-        fillna_value: Optional[float] = None,
-        static_covariates: Optional[Union[pd.Series, pd.DataFrame]] = None,
-        hierarchy: Optional[dict] = None,
-        metadata: Optional[dict] = None,
+        columns: Sequence | str | None = None,
+        fillna_value: float | None = None,
+        static_covariates: pd.Series | pd.DataFrame | None = None,
+        hierarchy: dict | None = None,
+        metadata: dict | None = None,
         copy: bool = True,
     ) -> Self:
         """Create an ``TimeSeries`` from an array of values.
@@ -1414,9 +1397,10 @@ class TimeSeries:
                     "r2": ["total"]
                 }
             ..
+
             The hierarchy can be used to reconcile forecasts (so that the sums of the forecasts at
             different levels are consistent), see `hierarchical reconciliation
-            <https://unit8co.github.io/darts/generated_api/darts.dataprocessing.transformers.reconciliation.html>`_.
+            <https://unit8co.github.io/darts/generated_api/darts.dataprocessing.transformers.reconciliation.html>`__.
         metadata
             Optionally, a dictionary with metadata to be added to the TimeSeries.
         copy
@@ -1454,15 +1438,19 @@ class TimeSeries:
     def from_json(
         cls,
         json_str: str,
-        static_covariates: Optional[Union[pd.Series, pd.DataFrame]] = None,
-        hierarchy: Optional[dict] = None,
-        metadata: Optional[dict] = None,
+        static_covariates: pd.Series | pd.DataFrame | None = None,
+        hierarchy: dict | None = None,
+        metadata: dict | None = None,
     ) -> Self:
         """Create a ``TimeSeries`` from the JSON String representation of a ``TimeSeries``.
 
         The JSON String representation can be generated with :func:`TimeSeries.to_json()`.
 
         At the moment this only supports deterministic time series (i.e., made of 1 sample).
+
+        If the JSON string contains static covariates, hierarchy, or metadata, they will be automatically
+        loaded. The optional parameters `static_covariates`, `hierarchy`, and `metadata` can be used to
+        override or provide these values if they are not present in the JSON string.
 
         Parameters
         ----------
@@ -1476,6 +1464,7 @@ class TimeSeries:
             are globally 'applied' to all components of the TimeSeries. If a multi-row DataFrame, the number of
             rows must match the number of components of the TimeSeries (in this case, the number of columns in
             ``value_cols``). This adds control for component-specific static covariates.
+            If the JSON string already contains static covariates, this parameter will override them.
         hierarchy
             Optionally, a dictionary describing the grouping(s) of the time series. The keys are component names, and
             for a given component name `c`, the value is a list of component names that `c` "belongs" to. For instance,
@@ -1497,11 +1486,14 @@ class TimeSeries:
                     "r2": ["total"]
                 }
             ..
+
             The hierarchy can be used to reconcile forecasts (so that the sums of the forecasts at
             different levels are consistent), see `hierarchical reconciliation
-            <https://unit8co.github.io/darts/generated_api/darts.dataprocessing.transformers.reconciliation.html>`_.
+            <https://unit8co.github.io/darts/generated_api/darts.dataprocessing.transformers.reconciliation.html>`__.
+            If the JSON string already contains a hierarchy, this parameter will override it.
         metadata
             Optionally, a dictionary with metadata to be added to the TimeSeries.
+            If the JSON string already contains metadata, this parameter will override it.
 
         Returns
         -------
@@ -1514,16 +1506,31 @@ class TimeSeries:
         >>> json_str = (
         >>>     '{"columns":["vals"],"index":["2020-01-01","2020-01-02","2020-01-03"],"data":[[0.0],[1.0],[2.0]]}'
         >>> )
-        >>> series = TimeSeries.from_json("data.csv")
+        >>> series = TimeSeries.from_json(json_str)
         >>> series.shape
         (3, 1, 1)
         """
+        parsed = json.loads(json_str)
+
+        static_covariates_ = parsed.pop("static_covariates", None)
+        if static_covariates_ is not None and static_covariates is None:
+            static_covariates = pd.DataFrame(**static_covariates_)
+
+        hierarchy_ = parsed.pop("hierarchy", None)
+        if hierarchy is None:
+            hierarchy = hierarchy_
+
+        metadata_ = parsed.pop("metadata", None)
+        if metadata is None:
+            metadata = metadata_
+
+        df = pd.read_json(StringIO(json.dumps(parsed)), orient="split")
         return cls.from_dataframe(
-            df=pd.read_json(StringIO(json_str), orient="split"),
+            df=df,
             static_covariates=static_covariates,
             hierarchy=hierarchy,
             metadata=metadata,
-            copy=False,  # JSON is immutable, so no need to copy
+            copy=False,
         )
 
     @classmethod
@@ -1549,7 +1556,7 @@ class TimeSeries:
     """
 
     @property
-    def static_covariates(self) -> Optional[pd.DataFrame]:
+    def static_covariates(self) -> pd.DataFrame | None:
         """The static covariates of this series.
 
         If defined, the static covariates are given as a `pandas.DataFrame`. The columns represent the static variables
@@ -1558,7 +1565,7 @@ class TimeSeries:
         return self._attrs.get(STATIC_COV_TAG, None)
 
     @property
-    def hierarchy(self) -> Optional[dict]:
+    def hierarchy(self) -> dict | None:
         """The hierarchy of this series.
 
         If defined, the hierarchy is given as a dictionary. The keys are the individual components and values are the
@@ -1567,7 +1574,7 @@ class TimeSeries:
         return self._attrs.get(HIERARCHY_TAG, None)
 
     @property
-    def metadata(self) -> Optional[dict]:
+    def metadata(self) -> dict | None:
         """The metadata of this series.
 
         If defined, the metadata is given as a dictionary.
@@ -1575,24 +1582,24 @@ class TimeSeries:
         return self._attrs.get(METADATA_TAG, None)
 
     @property
-    def top_level_component(self) -> Optional[str]:
+    def top_level_component(self) -> str | None:
         """The top level component name of this series, or `None` if the series has no hierarchy."""
         return self._top_level_component
 
     @property
-    def bottom_level_components(self) -> Optional[list[str]]:
+    def bottom_level_components(self) -> list[str] | None:
         """The bottom level component names of this series, or `None` if the series has no hierarchy."""
         return self._bottom_level_components
 
     @property
-    def top_level_series(self) -> Optional[Self]:
+    def top_level_series(self) -> Self | None:
         """The univariate series containing the single top-level component of this series, or `None` if the series has
         no hierarchy.
         """
         return self[self.top_level_component] if self.has_hierarchy else None
 
     @property
-    def bottom_level_series(self) -> Optional[list[Self]]:
+    def bottom_level_series(self) -> list[Self] | None:
         """The series containing the bottom-level components of this series in the same order as they appear in the
         series, or `None` if the series has no hierarchy.
         """
@@ -1648,7 +1655,7 @@ class TimeSeries:
         return self.shape[COMP_AX] == 1
 
     @property
-    def freq(self) -> Union[pd.DateOffset, int]:
+    def freq(self) -> pd.DateOffset | int:
         """The frequency of the series.
 
         A ``pandas.DateOffset`` if the series is indexed with a ``pandas.DatetimeIndex``.
@@ -1677,7 +1684,7 @@ class TimeSeries:
         return self.components
 
     @property
-    def time_index(self) -> Union[pd.DatetimeIndex, pd.RangeIndex]:
+    def time_index(self) -> TimeIndex:
         """The time index of the series."""
         return self._time_index.copy()
 
@@ -1715,7 +1722,7 @@ class TimeSeries:
         return self.metadata is not None
 
     @property
-    def duration(self) -> Union[pd.Timedelta, int]:
+    def duration(self) -> pd.Timedelta | int:
         """The duration of the series (as a ``pandas.Timedelta`` or `int`)."""
         return self._time_index[-1] - self._time_index[0]
 
@@ -1737,6 +1744,8 @@ class TimeSeries:
         xarray.DataArray
             An ``xarray.DataArray`` representation of  represents the time series.
         """
+        import xarray as xr
+
         xa = xr.DataArray(
             self._values,
             dims=(self._time_dim,) + DIMS[-2:],
@@ -1748,7 +1757,7 @@ class TimeSeries:
     def to_series(
         self,
         copy: bool = True,
-        backend: Union[ModuleType, Implementation, str] = Implementation.PANDAS,
+        backend: ModuleType | Implementation | str = Implementation.PANDAS,
     ):
         """Return a `Series` representation of the series in a given `backend`.
 
@@ -1760,7 +1769,7 @@ class TimeSeries:
             Whether to return a copy of the series. Leave it to True unless you know what you are doing.
         backend
             The backend to which to export the `TimeSeries`. See the `narwhals documentation
-            <https://narwhals-dev.github.io/narwhals/api-reference/narwhals/#narwhals.from_dict>`_ for all supported
+            <https://narwhals-dev.github.io/narwhals/api-reference/narwhals/#narwhals.from_dict>`__ for all supported
             backends.
 
         Returns
@@ -1787,30 +1796,40 @@ class TimeSeries:
     def to_dataframe(
         self,
         copy: bool = True,
-        backend: Union[ModuleType, Implementation, str] = Implementation.PANDAS,
+        backend: ModuleType | Implementation | str = Implementation.PANDAS,
         time_as_index: bool = True,
         suppress_warnings: bool = False,
+        add_static_covariates: bool | str | list[str] = False,
+        add_metadata: bool | str | list[str] = False,
     ):
         """Return a DataFrame representation of the series in a given `backend`.
 
         Each of the series components will appear as a column in the DataFrame.
-        If the series is stochastic, the samples are returned as columns of the dataframe with column names
+        If the series is stochastic, the samples are returned as columns of the DataFrame with column names
         as 'component_s#' (e.g. with two components and two samples:
         'comp0_s0', 'comp0_s1' 'comp1_s0' 'comp1_s1').
 
         Parameters
         ----------
         copy
-            Whether to return a copy of the dataframe. Leave it to True unless you know what you are doing.
+            Whether to return a copy of the DataFrame. Leave it to True unless you know what you are doing.
         backend
             The backend to which to export the `TimeSeries`. See the `narwhals documentation
-            <https://narwhals-dev.github.io/narwhals/api-reference/narwhals/#narwhals.from_dict>`_ for all supported
+            <https://narwhals-dev.github.io/narwhals/api-reference/narwhals/#narwhals.from_dict>`__ for all supported
             backends.
         time_as_index
-            Whether to set the time index as the index of the dataframe or in the left-most column.
+            Whether to set the time index as the index of the DataFrame or in the left-most column.
             Only effective with the pandas `backend`.
         suppress_warnings
             Whether to suppress the warnings for the `DataFrame` creation.
+        add_static_covariates
+            Whether to add the series' static covariates to the resulting DataFrame (one column per component-static
+            covariate pair). If a bool, controls whether to add all static covariates or none. If a string, or list of
+            strings, specifies the subset of static covariate columns / names to add.
+        add_metadata
+            Whether to add the series' metadata to the resulting DataFrame (one column per metadata entry). If a bool,
+            controls whether to add all metadata entries or none. If a string, or list of strings, specifies the subset
+            of metadata keys / names to add.
 
         Returns
         -------
@@ -1830,10 +1849,11 @@ class TimeSeries:
         if not self.is_deterministic:
             if not suppress_warnings:
                 logger.warning(
-                    "You are transforming a stochastic TimeSeries (i.e., contains several samples). "
+                    "You are transforming a stochastic TimeSeries (it contains several samples). "
                     "The resulting DataFrame is a 2D object with all samples on the columns. "
-                    "If this is not the expected behavior consider calling a function "
-                    "adapted to stochastic TimeSeries like quantile_df()."
+                    "If this is not the expected behavior, extract statistics from the TimeSeries "
+                    "before calling `to_dataframe()` (e.g. with `TimeSeries.quantile()`, `mean()`, "
+                    "...)."
                 )
 
             comp_name = list(self.components)
@@ -1846,6 +1866,66 @@ class TimeSeries:
         else:
             columns = self.components
             data = values[:, :, 0]
+        data = {col: data[:, idx] for idx, col in enumerate(columns)}
+
+        # handle static covariates
+        if add_static_covariates and self.has_static_covariates:
+            static_covs = self.static_covariates
+            components = list(static_covs.index)
+
+            if isinstance(add_static_covariates, bool):
+                static_cov_cols = static_covs.columns.tolist()
+            elif isinstance(add_static_covariates, str):
+                static_cov_cols = [add_static_covariates]
+            else:
+                static_cov_cols = add_static_covariates
+
+            missing_cols = set(static_cov_cols) - set(static_covs.columns)
+            if missing_cols:
+                raise_log(
+                    ValueError(
+                        f"The following static covariates to add via `add_static_covariates` "
+                        f"do not exist: {missing_cols}. Available static covariates are: "
+                        f"{static_covs.columns.tolist()}"
+                    ),
+                    logger=logger,
+                )
+
+            for static_cov_col in static_cov_cols:
+                for comp in components:
+                    value = static_covs.loc[comp, static_cov_col]
+                    data_col = np.full(len(self), value)
+                    if len(components) > 1:
+                        column = "_".join((static_cov_col, comp))
+                    else:
+                        column = static_cov_col
+                    data[column] = data_col
+
+        # handle metadata
+        if add_metadata and self.has_metadata:
+            metadata = self.metadata
+
+            if isinstance(add_metadata, bool):
+                metadata_cols = list(metadata)
+            elif isinstance(add_metadata, str):
+                metadata_cols = [add_metadata]
+            else:
+                metadata_cols = add_metadata
+
+            missing_cols = set(metadata_cols) - set(metadata)
+            if missing_cols:
+                raise_log(
+                    ValueError(
+                        f"The following metadata to add via `add_metadata` "
+                        f"do not exist: {missing_cols}. Available metadata are: "
+                        f"{set(metadata)}"
+                    ),
+                    logger=logger,
+                )
+
+            for metadata_col in metadata_cols:
+                data_col = np.full(len(self), metadata[metadata_col])
+                data[metadata_col] = data_col
 
         time_index = self._time_index
 
@@ -1855,12 +1935,10 @@ class TimeSeries:
 
         if time_as_index:
             # special path for pandas with index
-            return pd.DataFrame(data=data, index=time_index, columns=columns)
+            return pd.DataFrame(data=data, index=time_index)
 
-        data = {
-            time_index.name: time_index,  # set time_index as left-most column
-            **{col: data[:, idx] for idx, col in enumerate(columns)},
-        }
+        # set time_index as left-most column
+        data = {time_index.name or self.time_dim: time_index, **data}
 
         return nw.from_dict(data, backend=backend).to_native()
 
@@ -1890,7 +1968,7 @@ class TimeSeries:
             schema = {k: deepcopy(v) for k, v in schema.items()}
         return schema
 
-    def astype(self, dtype: Union[str, np.dtype]) -> Self:
+    def astype(self, dtype: str | np.dtype) -> Self:
         """Return a new series with the values have been converted to the desired `dtype`.
 
         Parameters
@@ -1910,23 +1988,23 @@ class TimeSeries:
             **self._attrs,
         )
 
-    def start_time(self) -> Union[pd.Timestamp, int]:
+    def start_time(self) -> pd.Timestamp | int:
         """Start time of the series.
 
         Returns
         -------
-        Union[pandas.Timestamp, int]
+        pandas.Timestamp | int
             A timestamp containing the first time of the TimeSeries (if indexed by DatetimeIndex),
             or an integer (if indexed by RangeIndex)
         """
         return self._time_index[0]
 
-    def end_time(self) -> Union[pd.Timestamp, int]:
+    def end_time(self) -> pd.Timestamp | int:
         """End time of the series.
 
         Returns
         -------
-        Union[pandas.Timestamp, int]
+        pandas.Timestamp | int
             A timestamp containing the last time of the TimeSeries (if indexed by DatetimeIndex),
             or an integer (if indexed by RangeIndex)
         """
@@ -2069,7 +2147,7 @@ class TimeSeries:
             values = values.copy()
         return values
 
-    def static_covariates_values(self, copy: bool = True) -> Optional[np.ndarray]:
+    def static_covariates_values(self, copy: bool = True) -> np.ndarray | None:
         """Return a 2-D array of dimension (component, static variable) containing the series' static covariate values.
 
         Parameters
@@ -2081,7 +2159,7 @@ class TimeSeries:
 
         Returns
         -------
-        Optional[numpy.ndarray]
+        numpy.ndarray | None
             The static covariate values if the series has static covariates, else `None`.
         """
         return (
@@ -2090,9 +2168,7 @@ class TimeSeries:
             else self.static_covariates
         )
 
-    def head(
-        self, size: Optional[int] = 5, axis: Optional[Union[int, str]] = 0
-    ) -> Self:
+    def head(self, size: int | None = 5, axis: int | str | None = 0) -> Self:
         """Return a new series with the first `size` points.
 
         Parameters
@@ -2123,9 +2199,7 @@ class TimeSeries:
                 **self._attrs,
             )
 
-    def tail(
-        self, size: Optional[int] = 5, axis: Optional[Union[int, str]] = 0
-    ) -> Self:
+    def tail(self, size: int | None = 5, axis: int | str | None = 0) -> Self:
         """Return a new series with the last `size` points.
 
         Parameters
@@ -2158,8 +2232,8 @@ class TimeSeries:
     def concatenate(
         self,
         other: Self,
-        axis: Optional[Union[str, int]] = 0,
-        ignore_time_axis: Optional[bool] = False,
+        axis: str | int | None = 0,
+        ignore_time_axis: bool | None = False,
         ignore_static_covariates: bool = False,
         drop_hierarchy: bool = True,
         drop_metadata: bool = False,
@@ -2297,9 +2371,7 @@ class TimeSeries:
             **self._attrs,
         )
 
-    def get_index_at_point(
-        self, point: Union[pd.Timestamp, float, int], after=True
-    ) -> int:
+    def get_index_at_point(self, point: pd.Timestamp | float | int, after=True) -> int:
         """Convert a point along the time index into an integer index ranging from (0, len(series)-1) inclusive.
 
         Parameters
@@ -2335,7 +2407,7 @@ class TimeSeries:
                     ValueError("point (float) should be between 0.0 and 1.0."), logger
                 )
             point_index = int((len(self) - 1) * point)
-        elif isinstance(point, (int, np.int64)):
+        elif isinstance(point, int | np.int64):
             if self.has_datetime_index or (self.start_time() == 0 and self.freq == 1):
                 point_index = point
             else:
@@ -2382,8 +2454,8 @@ class TimeSeries:
         return point_index
 
     def get_timestamp_at_point(
-        self, point: Union[pd.Timestamp, float, int]
-    ) -> Union[pd.Timestamp, int]:
+        self, point: pd.Timestamp | float | int
+    ) -> pd.Timestamp | int:
         """Convert a point into a ``pandas.Timestamp`` (if datetime-indexed) or integer (if integer-indexed).
 
         Parameters
@@ -2399,7 +2471,7 @@ class TimeSeries:
 
         Returns
         -------
-        Union[pandas.Timestamp, int]
+        pandas.Timestamp | int
             The index value corresponding to the provided point in the series.
             If the series is indexed by a `pandas.DatetimeIndex`, returns a `pandas.Timestamp`.
             If the series is indexed by a `pandas.RangeIndex`, returns an integer.
@@ -2408,7 +2480,7 @@ class TimeSeries:
         return self._time_index[idx]
 
     def _split_at(
-        self, split_point: Union[pd.Timestamp, float, int], after: bool = True
+        self, split_point: pd.Timestamp | float | int, after: bool = True
     ) -> tuple[Self, Self]:
         # Get index with not after in order to avoid moving twice if split_point is not in self
         point_index = self.get_index_at_point(split_point, not after)
@@ -2417,9 +2489,7 @@ class TimeSeries:
             self[point_index + (1 if after else 0) :],
         )
 
-    def split_after(
-        self, split_point: Union[pd.Timestamp, float, int]
-    ) -> tuple[Self, Self]:
+    def split_after(self, split_point: pd.Timestamp | float | int) -> tuple[Self, Self]:
         """Split the series in two, after a provided `split_point`.
 
         Parameters
@@ -2440,7 +2510,7 @@ class TimeSeries:
         return self._split_at(split_point, after=True)
 
     def split_before(
-        self, split_point: Union[pd.Timestamp, float, int]
+        self, split_point: pd.Timestamp | float | int
     ) -> tuple[Self, Self]:
         """Split the series in two, before a provided `split_point`.
 
@@ -2461,8 +2531,12 @@ class TimeSeries:
         """
         return self._split_at(split_point, after=False)
 
-    def drop_after(self, split_point: Union[pd.Timestamp, float, int]):
-        """Return a new series where everything after and including the provided time `split_point` was dropped.
+    def drop_after(
+        self,
+        split_point: pd.Timestamp | float | int,
+        keep_point: bool = False,
+    ):
+        """Return a new series where everything after (and in-/excluding) the provided time `split_point` was dropped.
 
         The timestamp may not be in the series. If it is, the timestamp will be dropped.
 
@@ -2470,16 +2544,25 @@ class TimeSeries:
         ----------
         split_point
             The timestamp that indicates cut-off time.
+        keep_point
+            Whether the provided `split_point` should be included in the returned series (if it exists in the series).
 
         Returns
         -------
         TimeSeries
             A series that contains all entries until `split_point` (exclusive).
         """
-        return self[: self.get_index_at_point(split_point, after=True)]
+        return self[
+            : self.get_index_at_point(split_point, after=not keep_point)
+            + int(keep_point)
+        ]
 
-    def drop_before(self, split_point: Union[pd.Timestamp, float, int]):
-        """Return a new series where everything before and including the provided time `split_point` was dropped.
+    def drop_before(
+        self,
+        split_point: pd.Timestamp | float | int,
+        keep_point: bool = False,
+    ):
+        """Return a new series where everything before (and in-/excluding) the provided time `split_point` was dropped.
 
         The timestamp may not be in the series. If it is, the timestamp will be dropped.
 
@@ -2487,17 +2570,20 @@ class TimeSeries:
         ----------
         split_point
             The timestamp that indicates cut-off time.
+        keep_point
+            Whether the provided `split_point` should be included in the returned series (if it exists in the series).
 
         Returns
         -------
         TimeSeries
             A series that contains all entries starting after `split_point` (exclusive).
         """
-        return self[self.get_index_at_point(split_point, after=False) + 1 :]
+        return self[
+            self.get_index_at_point(split_point, after=keep_point)
+            + int(not keep_point) :
+        ]
 
-    def slice(
-        self, start_ts: Union[pd.Timestamp, int], end_ts: Union[pd.Timestamp, int]
-    ):
+    def slice(self, start_ts: pd.Timestamp | int, end_ts: pd.Timestamp | int):
         """Return a slice of the series starting at `start_ts` and ending before `end_ts`.
 
         For series having DatetimeIndex, this is inclusive on both ends. For series having a RangeIndex,
@@ -2574,7 +2660,7 @@ class TimeSeries:
             idx = pd.RangeIndex(effective_start_ts, effective_end_ts, step=self.freq)
             return self[idx]
 
-    def slice_n_points_after(self, start_ts: Union[pd.Timestamp, int], n: int) -> Self:
+    def slice_n_points_after(self, start_ts: pd.Timestamp | int, n: int) -> Self:
         """Return a slice of the series starting at `start_ts` (inclusive) and having at most `n` points.
 
         Parameters
@@ -2593,7 +2679,7 @@ class TimeSeries:
             raise_log(ValueError("n should be a positive integer."), logger)
         self._raise_if_not_within(start_ts)
 
-        if isinstance(start_ts, (int, np.int64)):
+        if isinstance(start_ts, int | np.int64):
             return self[pd.RangeIndex(start=start_ts, stop=start_ts + n)]
         elif isinstance(start_ts, pd.Timestamp):
             # get first timestamp greater or equal to start_ts
@@ -2605,7 +2691,7 @@ class TimeSeries:
                 ValueError("start_ts must be an int or a pandas Timestamp."), logger
             )
 
-    def slice_n_points_before(self, end_ts: Union[pd.Timestamp, int], n: int) -> Self:
+    def slice_n_points_before(self, end_ts: pd.Timestamp | int, n: int) -> Self:
         """Return a slice of the series ending at `end_ts` (inclusive) and having at most `n` points.
 
         Parameters
@@ -2624,7 +2710,7 @@ class TimeSeries:
             raise_log(ValueError("n should be a positive integer."), logger)
         self._raise_if_not_within(end_ts)
 
-        if isinstance(end_ts, (int, np.int64)):
+        if isinstance(end_ts, int | np.int64):
             return self[pd.RangeIndex(start=end_ts - n + 1, stop=end_ts + 1)]
         elif isinstance(end_ts, pd.Timestamp):
             # get last timestamp smaller or equal to start_ts
@@ -2658,6 +2744,13 @@ class TimeSeries:
             return self[start:end]
         else:
             time_index = self.time_index.intersection(other.time_index)
+            # frequency is lost when len(time_index) < 3
+            if (
+                0 < len(time_index) < 3
+                and isinstance(time_index, pd.DatetimeIndex)
+                and time_index.freq is None
+            ):
+                time_index.freq = infer_freq_intersection(self.freq, other.freq)
             return self[time_index]
 
     def slice_intersect_values(self, other: Self, copy: bool = False) -> np.ndarray:
@@ -2687,9 +2780,7 @@ class TimeSeries:
         else:
             return vals[self._time_index.isin(other._time_index)]
 
-    def slice_intersect_times(
-        self, other: Self, copy: bool = True
-    ) -> Union[pd.DatetimeIndex, pd.RangeIndex]:
+    def slice_intersect_times(self, other: Self, copy: bool = True) -> TimeIndex:
         """Return the time index of the series where the time index was intersected with the `other` series.
 
         This method is in general *not* symmetric.
@@ -2704,7 +2795,7 @@ class TimeSeries:
 
         Returns
         -------
-        Union[pandas.DatetimeIndex, pandas.RangeIndex]
+        pandas.DatetimeIndex | pandas.RangeIndex
             The time index of this series, over the time-span common to both series.
         """
 
@@ -2860,7 +2951,7 @@ class TimeSeries:
         TimeSeries
             A new series, with a shifted time index.
         """
-        if not isinstance(n, (int, np.int64)):
+        if not isinstance(n, int | np.int64):
             logger.warning(
                 f"TimeSeries.shift(): converting n to int from {n} to {int(n)}"
             )
@@ -2892,9 +2983,9 @@ class TimeSeries:
 
     def diff(
         self,
-        n: Optional[int] = 1,
-        periods: Optional[int] = 1,
-        dropna: Optional[bool] = True,
+        n: int | None = 1,
+        periods: int | None = 1,
+        dropna: bool | None = True,
     ) -> Self:
         """Return a new series with differenced values.
 
@@ -3164,11 +3255,11 @@ class TimeSeries:
 
     def with_times_and_values(
         self,
-        times: Union[pd.DatetimeIndex, pd.RangeIndex, pd.Index],
+        times: TimeIndex | pd.Index,
         values: np.ndarray,
-        fill_missing_dates: Optional[bool] = False,
-        freq: Optional[Union[str, int]] = None,
-        fillna_value: Optional[float] = None,
+        fill_missing_dates: bool | None = False,
+        freq: str | int | None = None,
+        fillna_value: float | None = None,
     ) -> Self:
         """Return a new series similar to this one but with new `times` and `values`.
 
@@ -3190,7 +3281,7 @@ class TimeSeries:
             Optionally, a string or integer representing the frequency of the underlying index. This is useful in order
             to fill in missing values if some dates are missing and `fill_missing_dates` is set to `True`.
             If a string, represents the frequency of the pandas DatetimeIndex (see `offset aliases
-            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`_ for more info on
+            <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__ for more info on
             supported frequencies).
             If an integer, represents the step size of the pandas Index or pandas RangeIndex.
         fillna_value
@@ -3253,7 +3344,7 @@ class TimeSeries:
         )
 
     def with_static_covariates(
-        self, covariates: Optional[Union[pd.Series, pd.DataFrame]]
+        self, covariates: pd.Series | pd.DataFrame | None
     ) -> Self:
         """Return a new series with added static covariates.
 
@@ -3313,7 +3404,7 @@ class TimeSeries:
             metadata=self.metadata,
         )
 
-    def with_hierarchy(self, hierarchy: dict[str, Union[str, list[str]]]) -> Self:
+    def with_hierarchy(self, hierarchy: dict[str, str | list[str]]) -> Self:
         """Return a new series with added hierarchy.
 
         Parameters
@@ -3324,7 +3415,7 @@ class TimeSeries:
             For example, assume the series contains the components
             ``["total", "a", "b", "x", "y", "ax", "ay", "bx", "by"]``,
             the following dictionary would encode the groupings shown on
-            `this figure <https://otexts.com/fpp3/hts.html#fig:GroupTree>`_:
+            `this figure <https://otexts.com/fpp3/hts.html#fig:GroupTree>`__:
 
             .. highlight:: python
             .. code-block:: python
@@ -3353,7 +3444,7 @@ class TimeSeries:
             metadata=self.metadata,
         )
 
-    def with_metadata(self, metadata: Optional[dict]) -> Self:
+    def with_metadata(self, metadata: dict | None) -> Self:
         """Return a new series with added metadata.
 
         Parameters
@@ -3403,11 +3494,11 @@ class TimeSeries:
         """
         return concatenate([self, other], axis=1)
 
-    def drop_columns(self, col_names: Union[list[str], str]) -> Self:
+    def drop_columns(self, col_names: list[str] | str) -> Self:
         """Return a new series with dropped components (columns).
 
         Parameters
-        -------
+        ----------
         col_names
             String or list of strings corresponding to the columns to be dropped.
 
@@ -3445,7 +3536,7 @@ class TimeSeries:
             metadata=self.metadata,
         )
 
-    def univariate_component(self, index: Union[str, int]) -> Self:
+    def univariate_component(self, index: str | int) -> Self:
         """Return a new univariate series with a selected component.
 
         This drops the hierarchy (if any), and retains only the relevant static covariates column.
@@ -3468,7 +3559,7 @@ class TimeSeries:
         attribute,
         one_hot: bool = False,
         cyclic: bool = False,
-        tz: Optional[str] = None,
+        tz: TimeZone = None,
     ) -> Self:
         """Return a new series with one (or more) additional component(s) that contain an attribute of the series' time
         index.
@@ -3495,7 +3586,9 @@ class TimeSeries:
             Alternative to one_hot encoding, enable only one of the two.
             (adds 2 columns, corresponding to sin and cos transformation).
         tz
-            Optionally, a time zone to convert the time index to before computing the attributes.
+            Optionally, a time zone to convert the time index before computing attributes.
+            Supports any type handled by pandas
+            `tz_convert <https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DatetimeIndex.tz_convert.html>`__.
 
         Returns
         -------
@@ -3518,15 +3611,15 @@ class TimeSeries:
     def add_holidays(
         self,
         country_code: str,
-        prov: str = None,
-        state: str = None,
-        tz: Optional[str] = None,
+        prov: str | None = None,
+        state: str | None = None,
+        tz: TimeZone = None,
     ) -> Self:
         """Return a new series with an added holiday component.
 
         The holiday component is binary where `1` corresponds to a time step falling on a holiday.
 
-        Available countries can be found `here <https://github.com/dr-prodigy/python-holidays#available-countries>`_.
+        Available countries can be found `here <https://holidays.readthedocs.io/en/latest/#available-countries>`__.
 
         This works only for deterministic time series (i.e., made of 1 sample).
 
@@ -3539,7 +3632,9 @@ class TimeSeries:
         state
             The state
         tz
-            Optionally, a time zone to convert the time index to before computing the attributes.
+            Optionally, a time zone to convert the time index before computing attributes.
+            Supports any type handled by pandas
+            `tz_convert <https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DatetimeIndex.tz_convert.html>`__.
 
         Returns
         -------
@@ -3561,9 +3656,9 @@ class TimeSeries:
 
     def resample(
         self,
-        freq: Union[str, pd.DateOffset],
+        freq: str | pd.DateOffset,
         method: str = "pad",
-        method_kwargs: Optional[dict[str, Any]] = None,
+        method_kwargs: dict[str, Any] | None = None,
         **kwargs,
     ) -> Self:
         """Return a new series where the time index and values were resampled with a given frequency.
@@ -3578,7 +3673,7 @@ class TimeSeries:
         method
             A method to either aggregate grouped values (for down-sampling) or fill holes (for up-sampling)
             in the reindexed TimeSeries. For more information, see the `xarray DataArrayResample documentation
-            <https://docs.xarray.dev/en/stable/generated/xarray.core.resample.DataArrayResample.html>`_.
+            <https://docs.xarray.dev/en/stable/generated/xarray.core.resample.DataArrayResample.html>`__.
             Supported methods: ["all", "any", "asfreq", "backfill", "bfill", "count", "ffill", "first", "interpolate",
             "last", "max", "mean", "median", "min", "nearest", "pad", "prod", "quantile", "reduce", "std", "sum",
             "var"].
@@ -3589,7 +3684,7 @@ class TimeSeries:
             some keyword arguments for the `xarray.resample` method, notably `offset` or `base` to indicate where
             to start the resampling and avoid nan at the first value of the resampled TimeSeries
             For more information, see the `xarray resample() documentation
-            <https://docs.xarray.dev/en/stable/generated/xarray.DataArray.resample.html>`_.
+            <https://docs.xarray.dev/en/stable/generated/xarray.DataArray.resample.html>`__.
 
         Returns
         -------
@@ -3632,6 +3727,8 @@ class TimeSeries:
         [2.5]
         [4.5]]
         """
+        import xarray as xr
+
         method_kwargs = method_kwargs or {}
         if isinstance(freq, pd.DateOffset):
             freq = freq.freqstr
@@ -3653,7 +3750,7 @@ class TimeSeries:
             raise_log(ValueError(f"Unknown method: {method}"), logger)
         return self.__class__.from_xarray(new_xa)
 
-    def is_within_range(self, ts: Union[pd.Timestamp, int]) -> bool:
+    def is_within_range(self, ts: pd.Timestamp | int) -> bool:
         """Whether the given timestamp or integer is within the time interval of the series.
 
         `ts` does not need to be an element of the series' time index.
@@ -3672,17 +3769,15 @@ class TimeSeries:
 
     def map(
         self,
-        fn: Union[
-            Callable[[np.number], np.number],
-            Callable[[Union[pd.Timestamp, int], np.number], np.number],
-        ],
+        fn: Callable[[np.ndarray], np.ndarray]
+        | Callable[[TimeIndex, np.ndarray], np.ndarray],
     ) -> Self:  # noqa: E501
         """Return a new series with the function `fn` applied to the values of this series.
 
         If `fn` takes 1 argument it is simply applied on the values array of shape `(time, n_components, n_samples)`.
-        If `fn` takes 2 arguments, it is applied repeatedly on the `(ts, value[ts])` tuples, where `ts` denotes a
-        timestamp value, and `value[ts]` denotes the array of values at this timestamp, of shape
-        `(n_components, n_samples)`.
+        If `fn` takes 2 arguments, it is applied on the `(ts, values)` tuple, where `ts` denotes the
+        series' time index, and `values` denotes the series' array of values, of shape
+        `(n_timestamps, n_components, n_samples)`. Timestamp index's shape should be `(n, 1, 1)`;
 
         Parameters
         ----------
@@ -3698,9 +3793,36 @@ class TimeSeries:
         -------
         TimeSeries
             A new series with the function `fn` applied to the values.
+
+        Examples
+        --------
+        >>> from darts import TimeSeries
+        >>> from darts.utils.utils import generate_index
+        >>> # create a simple TimeSeries
+        >>> series = TimeSeries.from_times_and_values(
+        >>>     times=generate_index("2020-01-01", length=3, freq="D"),
+        >>>     values=range(3),
+        >>> )
+        >>> # map function on values only
+        >>> def fn1(values):
+        >>>     return values / 3.
+        >>>
+        >>> series.map(fn1).values()
+        array([[0.        ],
+               [0.33333333],
+               [0.66666667]])
+        >>>
+        >>> # map function on time index and values
+        >>> def fn2(times, values):
+        >>>     return values / times.days_in_month.values.reshape(-1, 1, 1)
+        >>>
+        >>> series.map(fn2).values()
+        array([[0.        ],
+               [0.03225806],
+               [0.06451613]])
         """
         if not isinstance(fn, Callable):
-            raise_log(TypeError("fn should be callable"), logger)
+            raise_log(TypeError("fn must be a callable"), logger)
 
         if isinstance(fn, np.ufunc):
             if fn.nin == 1 and fn.nout == 1:
@@ -3727,30 +3849,18 @@ class TimeSeries:
 
         if num_args == 1:  # apply fn on values directly
             values = fn(self._values)
-        elif num_args == 2:  # map function uses timestamp f(timestamp, x)
-            # go over shortest amount of iterations, either over time steps or components and samples
-            if self.n_timesteps <= self.n_components * self.n_samples:
-                new_vals = np.vstack([
-                    np.expand_dims(
-                        fn(self.time_index[i], self._values[i, :, :]), axis=0
-                    )
-                    for i in range(self.n_timesteps)
-                ])
-            else:
-                new_vals = np.stack(
-                    [
-                        np.column_stack([
-                            fn(self.time_index, self._values[:, i, j])
-                            for j in range(self.n_samples)
-                        ])
-                        for i in range(self.n_components)
-                    ],
-                    axis=1,
-                )
-            values = new_vals
-
+        elif num_args == 2:
+            # apply function on (times, values)
+            values = fn(self._time_index, self._values)
         else:
-            raise_log(ValueError("fn must have either one or two arguments"), logger)
+            raise_log(ValueError("fn must accept either one or two arguments"), logger)
+
+        if values.shape != self.shape:
+            raise_log(
+                ValueError(
+                    f"fn must return an array of shape `{self.shape}`. Received shape `{values.shape}`"
+                )
+            )
 
         return self.__class__(
             times=self._time_index,
@@ -3761,12 +3871,12 @@ class TimeSeries:
 
     def window_transform(
         self,
-        transforms: Union[dict, Sequence[dict]],
-        treat_na: Optional[Union[str, Union[int, float]]] = None,
-        forecasting_safe: Optional[bool] = True,
-        keep_non_transformed: Optional[bool] = False,
-        include_current: Optional[bool] = True,
-        keep_names: Optional[bool] = False,
+        transforms: dict | Sequence[dict],
+        treat_na: str | int | float | None = None,
+        forecasting_safe: bool | None = True,
+        keep_non_transformed: bool | None = False,
+        include_current: bool | None = True,
+        keep_names: bool | None = False,
     ) -> Self:
         """Return a new series with the specified window transformations applied.
 
@@ -3783,14 +3893,14 @@ class TimeSeries:
             :``"function"``: Mandatory. The name of one of the pandas builtin transformation functions,
                             or a callable function that can be applied to the input series.
                             Pandas' functions can be found in the
-                            `documentation <https://pandas.pydata.org/docs/reference/window.html>`_.
+                            `documentation <https://pandas.pydata.org/docs/reference/window.html>`__.
 
             :``"mode"``: Optional. The name of the pandas windowing mode on which the ``"function"`` is going to be
                         applied. The options are "rolling", "expanding" and "ewm".
                         If not provided, Darts defaults to "expanding".
                         User defined functions can use either "rolling" or "expanding" modes.
                         More information on pandas windowing operations can be found in the `documentation
-                        <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html>`_.
+                        <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html>`__.
 
             :``"components"``: Optional. A string or list of strings specifying the TimeSeries components on which the
                                transformation should be applied. If not specified, the transformation will be
@@ -3819,7 +3929,7 @@ class TimeSeries:
                 NaN). Darts reuses pandas defaults of 1 for "rolling" and "expanding" modes and of 0 for "ewm" mode.
             * :``"win_type"``: The type of weigthing to apply to the window elements.
                 If provided, it should be one of `scipy.signal.windows
-                <https://docs.scipy.org/doc/scipy/reference/signal.windows.html#module-scipy.signal.windows>`_.
+                <https://docs.scipy.org/doc/scipy/reference/signal.windows.html#module-scipy.signal.windows>`__.
             * :``"center"``: ``True``/``False`` to set the observation at the current timestep at the center of the
                 window (when ``forecasting_safe`` is `True`, Darts enforces ``"center"`` to ``False``).
             * :``"closed"``: ``"right"``/``"left"``/``"both"``/``"neither"`` to specify whether the right,
@@ -3827,7 +3937,7 @@ class TimeSeries:
                 Darts defaults to pandas default of ``"right"``.
 
             More information on the available functions and their parameters can be found in the
-            `Pandas documentation <https://pandas.pydata.org/docs/reference/window.html>`_.
+            `Pandas documentation <https://pandas.pydata.org/docs/reference/window.html>`__.
 
             For user-provided functions, extra keyword arguments in the transformation dictionary are passed to the
             user-defined function.
@@ -3836,9 +3946,9 @@ class TimeSeries:
             It is expected that the function returns a single
             value for each window. Other possible configurations can be found in the
             `pandas.DataFrame.rolling().apply()
-            documentation <https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.rolling.html>`_
+            documentation <https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.rolling.html>`__
             and `pandas.DataFrame.expanding().apply()
-            documentation <https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.expanding.html>`_.
+            documentation <https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.expanding.html>`__.
 
         treat_na
             Specifies how to treat missing values that were added by the window transformations
@@ -4081,7 +4191,7 @@ class TimeSeries:
                 logger,
             )
 
-        # read series dataframe
+        # read series DataFrame
         ts_df = self.to_dataframe(copy=False, suppress_warnings=True)
 
         # store some original attributes of the series
@@ -4203,12 +4313,12 @@ class TimeSeries:
                     logger,
                 )
 
-        if isinstance(treat_na, (int, float)) or (treat_na in VALID_BFILL_NA):
+        if isinstance(treat_na, int | float) or (treat_na in VALID_BFILL_NA):
             for i in range(0, len(added_na), n_samples):
                 s_idx = added_na[i : (i + n_samples)][0]
                 value = (
                     treat_na
-                    if isinstance(treat_na, (int, float))
+                    if isinstance(treat_na, int | float)
                     else resulting_transformations.values[s_idx, i : (i + n_samples)]
                 )
                 resulting_transformations.iloc[:s_idx, i : (i + n_samples)] = value
@@ -4219,7 +4329,7 @@ class TimeSeries:
                 drop_before_index:
             ]
 
-        # revert dataframe to TimeSeries
+        # revert DataFrame to TimeSeries
         new_index = original_index.__class__(resulting_transformations.index)
 
         if convert_hierarchy:
@@ -4250,17 +4360,31 @@ class TimeSeries:
 
         At the moment this function works only on deterministic time series (i.e., made of 1 sample).
 
-        Notes
-        -----
-        Static covariates are not returned in the JSON string. When using `TimeSeries.from_json()`, the static
-        covariates can be added with input argument `static_covariates`.
+        The JSON string includes the series values, time index, component names, as well as static covariates,
+        hierarchy, and metadata (if any).
 
         Returns
         -------
         str
             A JSON String representing the series
+
+        See Also
+        --------
+        TimeSeries.from_json : Create a TimeSeries from a JSON string.
         """
-        return self.to_dataframe().to_json(orient="split", date_format="iso")
+        result = json.loads(
+            self.to_dataframe().to_json(orient="split", date_format="iso")
+        )
+        if self.static_covariates is not None:
+            result["static_covariates"] = json.loads(
+                self.static_covariates.to_json(orient="split")
+            )
+        if self.hierarchy is not None:
+            result["hierarchy"] = self.hierarchy
+        if self.metadata is not None:
+            result["metadata"] = self.metadata
+
+        return json.dumps(result)
 
     def to_csv(self, *args, **kwargs):
         """Write the deterministic series to a CSV file.
@@ -4298,23 +4422,21 @@ class TimeSeries:
     def plot(
         self,
         new_plot: bool = False,
-        central_quantile: Union[float, str] = 0.5,
-        low_quantile: Optional[float] = 0.05,
-        high_quantile: Optional[float] = 0.95,
+        central_quantile: float | str = 0.5,
+        low_quantile: float | None = 0.05,
+        high_quantile: float | None = 0.95,
         default_formatting: bool = True,
-        title: Optional[str] = None,
-        label: Optional[Union[str, Sequence[str]]] = "",
+        title: str | None = None,
+        label: str | Sequence[str] | None = "",
         max_nr_components: int = 10,
-        ax: Optional[matplotlib.axes.Axes] = None,
-        alpha: Optional[float] = None,
-        color: Optional[Union[str, tuple, Sequence[str, tuple]]] = None,
-        c: Optional[Union[str, tuple, Sequence[str, tuple]]] = None,
+        ax: matplotlib.axes.Axes | None = None,
+        alpha: float | None = None,
+        color: str | tuple | Sequence[str, tuple] | None = None,
+        c: str | tuple | Sequence[str, tuple] | None = None,
         *args,
         **kwargs,
     ) -> matplotlib.axes.Axes:
-        """Plot the series.
-
-        This is a wrapper method around :func:`xarray.DataArray.plot()`.
+        """Plot the series using Matplotlib.
 
         Parameters
         ----------
@@ -4328,7 +4450,7 @@ class TimeSeries:
         low_quantile
             The quantile to use for the lower bound of the plotted confidence interval. Similar to `central_quantile`,
             this is applied to each component separately (i.e., displaying marginal distributions). No confidence
-            interval is shown if `confidence_low_quantile` is None (default 0.05).
+            interval is shown if `low_quantile` is None (default 0.05).
         high_quantile
             The quantile to use for the upper bound of the plotted confidence interval. Similar to `central_quantile`,
             this is applied to each component separately (i.e., displaying marginal distributions). No confidence
@@ -4336,7 +4458,7 @@ class TimeSeries:
         default_formatting
             Whether to use the darts default scheme.
         title
-            Optionally, a custom plot title. If `None`, will use the name of the underlying `xarray.DataArray`.
+            Optionally, a plot title.
         label
             Can either be a string or list of strings. If a string and the series only has a single component, it is
             used as the label for that component. If a string and the series has multiple components, it is used as
@@ -4368,174 +4490,119 @@ class TimeSeries:
         matplotlib.axes.Axes
             Either the passed `ax` axis, a newly created one if `new_plot=True`, or the existing one.
         """
-        alpha_confidence_intvls = 0.25
+        from darts.utils._plotting import plot as _plot
 
-        if central_quantile != "mean":
-            if not (
-                isinstance(central_quantile, float) and 0.0 <= central_quantile <= 1.0
-            ):
-                raise_log(
-                    ValueError(
-                        'central_quantile must be either "mean", or a float between 0 and 1.'
-                    ),
-                    logger,
-                )
+        return _plot(
+            self,
+            new_plot=new_plot,
+            central_quantile=central_quantile,
+            low_quantile=low_quantile,
+            high_quantile=high_quantile,
+            default_formatting=default_formatting,
+            title=title,
+            label=label,
+            max_nr_components=max_nr_components,
+            ax=ax,
+            alpha=alpha,
+            color=color,
+            c=c,
+            *args,
+            **kwargs,
+        )
 
-        if high_quantile is not None and low_quantile is not None:
-            if not (0.0 <= low_quantile <= 1.0 and 0.0 <= high_quantile <= 1.0):
-                raise_log(
-                    ValueError(
-                        "confidence interval low and high quantiles must be between 0 and 1.",
-                    ),
-                    logger,
-                )
+    def plotly(
+        self,
+        fig: go.Figure | None = None,
+        central_quantile: float | str = 0.5,
+        low_quantile: float | None = 0.05,
+        high_quantile: float | None = 0.95,
+        title: str | None = None,
+        label: str | Sequence[str] | None = "",
+        max_nr_components: int = 10,
+        alpha: float | None = None,
+        color: str | Sequence[str] | None = None,
+        c: str | Sequence[str] | None = None,
+        downsample_threshold: int = 100_000,
+        **kwargs,
+    ) -> go.Figure:
+        """Plot the series using Plotly.
 
-        if max_nr_components == -1:
-            n_components_to_plot = self.n_components
-        else:
-            n_components_to_plot = min(self.n_components, max_nr_components)
+        Parameters
+        ----------
+        fig
+            Optionally, a Plotly `go.Figure` object to plot on. If provided, the series will be added to this
+            figure. If None, a new figure will be created.
+        central_quantile
+            The quantile (between 0 and 1) to plot as a "central" value, if the series is stochastic (i.e., if
+            it has multiple samples). This will be applied on each component separately (i.e., to display quantiles
+            of the components' marginal distributions). For instance, setting `central_quantile=0.5` will plot the
+            median of each component. `central_quantile` can also be set to 'mean'.
+        low_quantile
+            The quantile to use for the lower bound of the plotted confidence interval. Similar to `central_quantile`,
+            this is applied to each component separately (i.e., displaying marginal distributions). No confidence
+            interval is shown if `low_quantile` is None (default 0.05).
+        high_quantile
+            The quantile to use for the upper bound of the plotted confidence interval. Similar to `central_quantile`,
+            this is applied to each component separately (i.e., displaying marginal distributions). No confidence
+            interval is shown if `high_quantile` is None (default 0.95).
+        title
+            Optionally, a plot title.
+        label
+            Can either be a string or list of strings. If a string and the series only has a single component, it is
+            used as the label for that component. If a string and the series has multiple components, it is used as
+            a prefix for each component name. If a list of strings with length equal to the number of components in
+            the series, the labels will be mapped to the components in order.
+        max_nr_components
+            The maximum number of components of a series to plot. -1 means all components will be plotted.
+        alpha
+            Optionally, set the line alpha for deterministic series, or the confidence interval alpha for
+            probabilistic series.
+        color
+            Set the line color(s). Can be a single color string (name or hex), or a sequence of
+            strings (one per component). If a sequence, it must match the number of components.
+            By default, colors are pulled from the active Plotly template.
+        c
+            An alias for `color`.
+        downsample_threshold
+            The maximum number of total data points (time steps * components * traces) to plot.
+            If exceeded, the series will be automatically downsampled using a constant step
+            size to avoid rendering crashes. Set to -1 to disable downsampling. Defaults to 100,000.
+        **kwargs
+            Additional keyword arguments to pass to `plotly.graph_objects.Scatter()` for trace customization
+            (e.g., `line_dash`, `line_width`, `marker_symbol`, `opacity`, or `hovertemplate`).
 
-        if self.n_components > n_components_to_plot:
-            logger.warning(
-                f"Number of series components ({self.n_components}) is larger than the maximum number of "
-                f"components to plot ({max_nr_components}). Plotting only the first `{max_nr_components}` "
-                f"components. You can adjust the number of components to plot using `max_nr_components`."
-            )
+        Returns
+        -------
+        plotly.graph_objects.Figure
+            The Plotly figure object containing the plot. Call `.show()` on the returned figure to display it.
+        """
+        from darts.utils._plotting import plotly as _plotly
 
-        if not isinstance(label, str) and isinstance(label, Sequence):
-            if len(label) != self.n_components and len(label) != n_components_to_plot:
-                raise_log(
-                    ValueError(
-                        f"The `label` sequence must have the same length as the number of series components "
-                        f"({self.n_components}) or as the number of plotted components ({n_components_to_plot}). "
-                        f"Received length `{len(label)}`."
-                    ),
-                    logger,
-                )
-            custom_labels = True
-        else:
-            custom_labels = False
-
-        if color and c:
-            raise_log(
-                ValueError(
-                    "`color` and `c` must not be used simultaneously, use one or the other."
-                ),
-                logger,
-            )
-        color = color or c
-        if not isinstance(color, (str, tuple)) and isinstance(color, Sequence):
-            if len(color) != self.n_components and len(color) != n_components_to_plot:
-                raise_log(
-                    ValueError(
-                        f"The `color` sequence must have the same length as the number of series components "
-                        f"({self.n_components}) or as the number of plotted components ({n_components_to_plot}). "
-                        f"Received length `{len(label)}`."
-                    ),
-                    logger,
-                )
-            custom_colors = True
-        else:
-            custom_colors = False
-
-        kwargs["alpha"] = alpha
-        if not any(lw in kwargs for lw in ["lw", "linewidth"]):
-            kwargs["lw"] = 2
-
-        if new_plot:
-            fig, ax = plt.subplots()
-        else:
-            if ax is None:
-                ax = plt.gca()
-
-        # TODO: migrate from xarray plotting to something else
-        data_array = self.data_array(copy=False)
-        for i, c in enumerate(data_array.component[:n_components_to_plot]):
-            comp_name = str(c.values)
-            comp = data_array.sel(component=c)
-
-            if comp.sample.size > 1:
-                if central_quantile == "mean":
-                    central_series = comp.mean(dim=DIMS[2])
-                else:
-                    central_series = comp.quantile(q=central_quantile, dim=DIMS[2])
-            else:
-                central_series = comp.mean(dim=DIMS[2])
-
-            if custom_labels:
-                label_to_use = label[i]
-            else:
-                if label == "":
-                    label_to_use = comp_name
-                elif len(self.components) == 1:
-                    label_to_use = label
-                else:
-                    label_to_use = f"{label}_{comp_name}"
-            kwargs["label"] = label_to_use
-            kwargs["c"] = color[i] if custom_colors else color
-
-            kwargs_central = deepcopy(kwargs)
-            if not self.is_deterministic:
-                kwargs_central["alpha"] = 1
-            if central_series.shape[0] > 1:
-                p = central_series.plot(*args, ax=ax, **kwargs_central)
-            # empty TimeSeries
-            elif central_series.shape[0] == 0:
-                p = ax.plot(
-                    [],
-                    [],
-                    *args,
-                    **kwargs_central,
-                )
-            else:
-                p = ax.plot(
-                    [self.start_time()],
-                    central_series.values[0],
-                    "o",
-                    *args,
-                    **kwargs_central,
-                )
-            ax.set_xlabel(self.time_dim)
-            color_used = p[0].get_color() if default_formatting else None
-
-            # Optionally show confidence intervals
-            if (
-                comp.sample.size > 1
-                and low_quantile is not None
-                and high_quantile is not None
-            ):
-                low_series = comp.quantile(q=low_quantile, dim=DIMS[2])
-                high_series = comp.quantile(q=high_quantile, dim=DIMS[2])
-                if low_series.shape[0] > 1:
-                    ax.fill_between(
-                        self.time_index,
-                        low_series,
-                        high_series,
-                        color=color_used,
-                        alpha=(alpha if alpha is not None else alpha_confidence_intvls),
-                    )
-                else:
-                    ax.plot(
-                        [self.start_time(), self.start_time()],
-                        [low_series.values[0], high_series.values[0]],
-                        "-+",
-                        color=color_used,
-                        lw=2,
-                    )
-
-        ax.legend()
-        ax.set_title(title if title is not None else data_array.name)
-        return ax
+        return _plotly(
+            self,
+            fig=fig,
+            central_quantile=central_quantile,
+            low_quantile=low_quantile,
+            high_quantile=high_quantile,
+            title=title,
+            label=label,
+            max_nr_components=max_nr_components,
+            alpha=alpha,
+            color=color,
+            c=c,
+            downsample_threshold=downsample_threshold,
+            **kwargs,
+        )
 
     def with_columns_renamed(
-        self, col_names: Union[list[str], str], col_names_new: Union[list[str], str]
+        self, col_names: list[str] | str, col_names_new: list[str] | str
     ) -> Self:
         """Return a new series with new columns/components names.
 
         It also adapts the names in the hierarchy, if any.
 
         Parameters
-        -------
+        ----------
         col_names
             String or list of strings corresponding the the column names to be changed.
         col_names_new
@@ -4745,7 +4812,7 @@ class TimeSeries:
             **(self._attrs if axis != 1 else dict()),
         )
 
-    def quantile(self, q: Union[float, Sequence[float]] = 0.5, **kwargs) -> Self:
+    def quantile(self, q: float | Sequence[float] = 0.5, **kwargs) -> Self:
         """Return a deterministic series with the desired quantile(s) `q` of each component computed over the samples
         of the stochastic series.
 
@@ -4771,10 +4838,11 @@ class TimeSeries:
             A new series containing the desired quantile(s) of each component.
         """
         self._assert_stochastic()
-        if isinstance(q, float):
-            q = [q]
 
-        if not all([0 <= q_i <= 1 for q_i in q]):
+        # `q_arr` must be of same dtype to conserve it in `np.quantile`
+        q_arr = np.array([q] if isinstance(q, float) else q, dtype=self.dtype)
+
+        if not all([0 <= q_i <= 1 for q_i in q_arr]):
             raise_log(
                 ValueError(
                     "The quantile values must be expressed as fraction (between 0 and 1 inclusive)."
@@ -4783,10 +4851,10 @@ class TimeSeries:
             )
 
         # component names
-        cnames = [f"{comp}_q{q_i:.2f}" for comp in self.components for q_i in q]
+        cnames = [f"{comp}_q{q_i:.3f}" for comp in self.components for q_i in q_arr]
 
         # get quantiles of shape (n quantiles, n times, n components)
-        new_data = np.quantile(self._values, q=q, axis=2, **kwargs)
+        new_data = np.quantile(self._values, q=q_arr, axis=2, **kwargs)
         # transpose and reshape into (n times, n components * n quantiles, 1)
         new_data = new_data.transpose((1, 2, 0)).reshape(len(self), len(cnames), 1)
 
@@ -4795,8 +4863,8 @@ class TimeSeries:
             times=self._time_index,
             values=new_data,
             components=cnames,
-            static_covariates=self.static_covariates if len(q) == 1 else None,
-            hierarchy=self.hierarchy if len(q) == 1 else None,
+            static_covariates=self.static_covariates if len(q_arr) == 1 else None,
+            hierarchy=self.hierarchy if len(q_arr) == 1 else None,
             metadata=self.metadata,
             copy=False,
         )
@@ -4859,6 +4927,8 @@ class TimeSeries:
         TimeSeries
             A new series containing the skew of each component.
         """
+        from scipy.stats import skew
+
         self._assert_stochastic()
         vals = np.expand_dims(skew(self._values, axis=2, **kwargs), axis=2)
         return self.with_values(vals)
@@ -4879,6 +4949,8 @@ class TimeSeries:
         TimeSeries
             A new series containing the kurtosis of each component.
         """
+        from scipy.stats import kurtosis
+
         self._assert_stochastic()
         vals = np.expand_dims(kurtosis(self._values, axis=2, **kwargs), axis=2)
         return self.with_values(vals)
@@ -4889,16 +4961,16 @@ class TimeSeries:
 
     def _extract_values(
         self,
-        other: Union[Self, xr.DataArray, np.ndarray],
+        other: Self | xr.DataArray | np.ndarray,
     ) -> Self:
         """Extract values from another series or array and check for compatible shapes."""
 
         if isinstance(other, TimeSeries):
             other_vals = other._values
-        elif isinstance(other, xr.DataArray):
-            other_vals = other.values
-        else:
+        elif isinstance(other, np.ndarray):
             other_vals = other
+        else:
+            other_vals = other.values
 
         t, c, s = self.shape
         other_shape = other_vals.shape
@@ -4923,14 +4995,14 @@ class TimeSeries:
     @classmethod
     def _fill_missing_dates(
         cls,
-        times: Union[pd.DatetimeIndex, pd.RangeIndex, pd.Index],
+        times: TimeIndex | pd.Index,
         values: np.ndarray,
-        freq: Optional[Union[str, int]] = None,
-    ) -> tuple[Union[pd.DatetimeIndex, pd.RangeIndex], np.ndarray]:
+        freq: str | int | None = None,
+    ) -> tuple[TimeIndex, np.ndarray]:
         """Return the time index and values with missing dates inserted.
 
         This requires either a provided `freq` or the possibility to infer a unique frequency from `times` (see
-        `offset aliases <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`_
+        `offset aliases <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__
         for more info on supported frequencies).
 
         Parameters
@@ -4953,7 +5025,7 @@ class TimeSeries:
 
         Returns
         -------
-        tuple[Union[pandas.DatetimeIndex, pandas.RangeIndex], numpy.ndarray]
+        tuple[pandas.DatetimeIndex | pandas.RangeIndex, numpy.ndarray]
             The `times` with inserted missing dates and `values` with `numpy.nan` for the newly inserted dates.
         """
 
@@ -5004,9 +5076,9 @@ class TimeSeries:
 
     @staticmethod
     def _sort_index(
-        times: Union[pd.DatetimeIndex, pd.RangeIndex, pd.Index],
+        times: TimeIndex | pd.Index,
         values: np.ndarray,
-    ) -> tuple[Union[pd.DatetimeIndex, pd.RangeIndex], np.ndarray]:
+    ) -> tuple[TimeIndex, np.ndarray]:
         """Sort `times` and `values` by ascending dates.
 
         Only performed if `times` is not already monotonically increasing.
@@ -5054,7 +5126,7 @@ class TimeSeries:
         cls,
         times: pd.Index,
         values: np.ndarray,
-    ) -> tuple[Union[pd.DatetimeIndex, pd.RangeIndex], np.ndarray]:
+    ) -> tuple[TimeIndex, np.ndarray]:
         """Return `times` re-indexed into a `pandas.RangeIndex` and `values` in the re-indexed order.
 
         An integer `pandas.Index` can be converted to a `pandas.RangeIndex`, if the sorted index has a constant step
@@ -5083,10 +5155,10 @@ class TimeSeries:
     @classmethod
     def _restore_from_frequency(
         cls,
-        times: Union[pd.DatetimeIndex, pd.RangeIndex, pd.Index],
+        times: TimeIndex | pd.Index,
         values: np.ndarray,
-        freq: Union[str, int],
-    ) -> tuple[Union[pd.DatetimeIndex, pd.RangeIndex], np.ndarray]:
+        freq: str | int,
+    ) -> tuple[TimeIndex, np.ndarray]:
         """Return `times` resampled with frequency `freq` and values with `np.nan` for the newly inserted dates.
 
         The frequency `freq` must represent a target frequency that allows to maintain all dates from `times`.
@@ -5109,7 +5181,7 @@ class TimeSeries:
 
         Returns
         -------
-        tuple[Union[pandas.DatetimeIndex, pandas.RangeIndex], numpy.ndarray]
+        tuple[pandas.DatetimeIndex | pandas.RangeIndex, numpy.ndarray]
             The resampled `times` with frequency `freq` and `values` with `numpy.nan` for the newly inserted dates.
         """
         times, values = cls._sort_index(times=times, values=values)
@@ -5160,7 +5232,7 @@ class TimeSeries:
         return resampled_times.index, resampled_values
 
     @staticmethod
-    def _get_axis(axis: Union[int, str]) -> int:
+    def _get_axis(axis: int | str) -> int:
         """Convert different `axis` types to an integer axis."""
         if isinstance(axis, int):
             if not 0 <= axis <= 2:
@@ -5179,9 +5251,7 @@ class TimeSeries:
                 )
             return DIMS.index(axis)
 
-    def _get_agg_dims(
-        self, new_cname: str, axis: int
-    ) -> tuple[Union[pd.DatetimeIndex, pd.RangeIndex], pd.Index]:
+    def _get_agg_dims(self, new_cname: str, axis: int) -> tuple[TimeIndex, pd.Index]:
         """Get output time index and components based on a aggregation `axis` and potential new column name
         `new_cname`.
         """
@@ -5198,10 +5268,10 @@ class TimeSeries:
                 logger,
             )
 
-    def _get_first_timestamp_after(self, ts: pd.Timestamp) -> Union[pd.Timestamp, int]:
+    def _get_first_timestamp_after(self, ts: pd.Timestamp) -> pd.Timestamp | int:
         return next(filter(lambda t: t >= ts, self._time_index))
 
-    def _get_last_timestamp_before(self, ts: pd.Timestamp) -> Union[pd.Timestamp, int]:
+    def _get_last_timestamp_before(self, ts: pd.Timestamp) -> pd.Timestamp | int:
         return next(filter(lambda t: t <= ts, self._time_index[::-1]))
 
     def _assert_univariate(self):
@@ -5232,7 +5302,7 @@ class TimeSeries:
                 logger,
             )
 
-    def _raise_if_not_within(self, ts: Union[pd.Timestamp, int]):
+    def _raise_if_not_within(self, ts: pd.Timestamp | int):
         if isinstance(ts, pd.Timestamp):
             # Not that the converse doesn't apply (a time-indexed series can be called with an integer)
             if not self._has_datetime_index:
@@ -5300,9 +5370,9 @@ class TimeSeries:
         return len(self._values)
 
     def __add__(self, other):
-        if isinstance(other, (TimeSeries, xr.DataArray, np.ndarray)):
+        if isinstance(other, TimeSeries | np.ndarray) or _is_xarray(other):
             other = self._extract_values(other)
-        elif not isinstance(other, (int, float, np.integer)):
+        elif not isinstance(other, int | float | np.integer):
             raise_log(
                 TypeError(
                     f"unsupported operand type(s) for + or add(): '{type(self).__name__}' and '{type(other).__name__}'."
@@ -5317,9 +5387,9 @@ class TimeSeries:
         return self + other
 
     def __sub__(self, other):
-        if isinstance(other, (TimeSeries, xr.DataArray, np.ndarray)):
+        if isinstance(other, TimeSeries | np.ndarray) or _is_xarray(other):
             other = self._extract_values(other)
-        elif not isinstance(other, (int, float, np.integer)):
+        elif not isinstance(other, int | float | np.integer):
             raise_log(
                 TypeError(
                     f"unsupported operand type(s) for - or sub(): '{type(self).__name__}' and '{type(other).__name__}'."
@@ -5334,9 +5404,9 @@ class TimeSeries:
         return other + (-self)
 
     def __mul__(self, other):
-        if isinstance(other, (TimeSeries, xr.DataArray, np.ndarray)):
+        if isinstance(other, TimeSeries | np.ndarray) or _is_xarray(other):
             other = self._extract_values(other)
-        elif not isinstance(other, (int, float, np.integer)):
+        elif not isinstance(other, int | float | np.integer):
             raise_log(
                 TypeError(
                     f"unsupported operand type(s) for * or mul(): '{type(self).__name__}' and '{type(other).__name__}'."
@@ -5351,14 +5421,14 @@ class TimeSeries:
         return self * other
 
     def __pow__(self, n):
-        if isinstance(n, (int, float, np.integer)):
+        if isinstance(n, int | float | np.integer):
             if n < 0:
                 raise_log(
                     ValueError("Attempted to raise a series to a negative power."),
                     logger,
                 )
             n = float(n)
-        elif isinstance(n, (TimeSeries, xr.DataArray, np.ndarray)):
+        elif isinstance(n, TimeSeries | np.ndarray) or _is_xarray(n):
             n = self._extract_values(n)  # elementwise power
         else:
             raise_log(
@@ -5372,10 +5442,10 @@ class TimeSeries:
         return ts
 
     def __truediv__(self, other):
-        if isinstance(other, (int, float, np.integer)):
+        if isinstance(other, int | float | np.integer):
             if other == 0:
                 raise_log(ZeroDivisionError("Cannot divide by 0."), logger)
-        elif isinstance(other, (TimeSeries, xr.DataArray, np.ndarray)):
+        elif isinstance(other, TimeSeries | np.ndarray) or _is_xarray(other):
             other = self._extract_values(other)
             if (other == 0).any():
                 raise_log(
@@ -5407,7 +5477,7 @@ class TimeSeries:
         np.negative(ts._values, out=ts._values)
         return ts
 
-    def __contains__(self, ts: Union[int, pd.Timestamp]) -> bool:
+    def __contains__(self, ts: int | pd.Timestamp) -> bool:
         return ts in self.time_index
 
     def __round__(self, n=None):
@@ -5416,9 +5486,9 @@ class TimeSeries:
         return ts
 
     def __lt__(self, other) -> np.ndarray:
-        if isinstance(other, (TimeSeries, xr.DataArray, np.ndarray)):
+        if isinstance(other, TimeSeries | np.ndarray) or _is_xarray(other):
             other = self._extract_values(other)
-        elif not isinstance(other, (int, float, np.integer)):
+        elif not isinstance(other, int | float | np.integer):
             raise_log(
                 TypeError(
                     f"unsupported operand type(s) for < : '{type(self).__name__}' and '{type(other).__name__}'."
@@ -5428,9 +5498,9 @@ class TimeSeries:
         return np.less(self._values, other)
 
     def __gt__(self, other) -> np.ndarray:
-        if isinstance(other, (TimeSeries, xr.DataArray, np.ndarray)):
+        if isinstance(other, TimeSeries | np.ndarray) or _is_xarray(other):
             other = self._extract_values(other)
-        elif not isinstance(other, (int, float, np.integer)):
+        elif not isinstance(other, int | float | np.integer):
             raise_log(
                 TypeError(
                     f"unsupported operand type(s) for > : '{type(self).__name__}' and '{type(other).__name__}'."
@@ -5440,9 +5510,9 @@ class TimeSeries:
         return np.greater(self._values, other)
 
     def __le__(self, other) -> np.ndarray:
-        if isinstance(other, (TimeSeries, xr.DataArray, np.ndarray)):
+        if isinstance(other, TimeSeries | np.ndarray) or _is_xarray(other):
             other = self._extract_values(other)
-        elif not isinstance(other, (int, float, np.integer)):
+        elif not isinstance(other, int | float | np.integer):
             raise_log(
                 TypeError(
                     f"unsupported operand type(s) for <= : '{type(self).__name__}' and '{type(other).__name__}'."
@@ -5452,9 +5522,9 @@ class TimeSeries:
         return np.less_equal(self._values, other)
 
     def __ge__(self, other) -> np.ndarray:
-        if isinstance(other, (TimeSeries, xr.DataArray, np.ndarray)):
+        if isinstance(other, TimeSeries | np.ndarray) or _is_xarray(other):
             other = self._extract_values(other)
-        elif not isinstance(other, (int, float, np.integer)):
+        elif not isinstance(other, int | float | np.integer):
             raise_log(
                 TypeError(
                     f"unsupported operand type(s) for >= : '{type(self).__name__}' and '{type(other).__name__}'."
@@ -5464,23 +5534,102 @@ class TimeSeries:
         return np.greater_equal(self._values, other)
 
     def __str__(self):
-        return str(self.data_array(copy=False)).replace(
-            "xarray.DataArray", "TimeSeries (DataArray)"
-        )
+        values_str, info_str = self._get_values_repr("string")
+
+        representation = f"{values_str}\n\n{info_str}\n\n"
+
+        if self.static_covariates is not None:
+            static_cov_str = self.static_covariates.to_string(max_rows=10, max_cols=10)
+            # indentation, first line needs to be manual
+            static_cov_str = "    " + static_cov_str.replace("\n", "\n    ")
+            representation += f"Static covariates:\n{static_cov_str}\n"
+        if self.hierarchy is not None:
+            representation += f"Hierarchy:\n{format_dict(self.hierarchy)}\n"
+        if self.metadata is not None:
+            representation += f"Metadata:\n{format_dict(self.metadata)}\n"
+
+        return representation.rstrip()
 
     def __repr__(self):
-        return (
-            self.data_array(copy=False)
-            .__repr__()
-            .replace("xarray.DataArray", "TimeSeries")
-        )
+        return str(self)
 
     def _repr_html_(self):
-        return (
-            self.data_array(copy=False)
-            ._repr_html_()
-            .replace("xarray.DataArray", "TimeSeries")
+        values_str, info_str = self._get_values_repr("html")
+
+        representation = make_paragraph(values_str, margin_left="0") + make_paragraph(
+            info_str
         )
+        if self.static_covariates is not None:
+            representation += make_collapsible_section(
+                "Static covariates",
+                self.static_covariates.to_html(max_rows=10, max_cols=10)
+                if self.static_covariates is not None
+                else "&lt;empty&gt;",
+                open_by_default=True,
+            )
+        if self.hierarchy is not None:
+            representation += make_collapsible_section(
+                "Hierarchy",
+                f"{format_dict(self.hierarchy, render_html=True)}",
+                open_by_default=True,
+            )
+        if self.metadata is not None:
+            representation += make_collapsible_section(
+                "Metadata",
+                f"{format_dict(self.metadata, render_html=True)}",
+                open_by_default=True,
+            )
+        return representation
+
+    def _get_values_repr(self, repr_type: str) -> tuple[str, str]:
+        """Create a representation of the TimeSeries values.
+
+        The returned dimensions respect the maximum allowed items to be displayed
+
+        Parameters
+        ----------
+        repr_type
+            The type of representation to use ("html" or "string").
+        """
+        max_rows = get_option("display.max_rows")
+        max_cols = get_option("display.max_cols")
+        margin = 2
+        values = self.all_values(copy=False)
+        times = self.time_index
+        columns = self.columns
+
+        # limit the number of rows
+        if self.n_timesteps > max_rows + 2 * margin:
+            n_rows = math.ceil(max_rows / 2) + margin
+            values = np.concatenate([values[:n_rows], values[-n_rows:]], axis=TIME_AX)
+            times = times[:n_rows].append(times[-n_rows:])
+        # limit the number of columns
+        if self.n_components > max_cols + 2 * margin:
+            n_cols = math.ceil(max_cols / 2) + margin
+            values = np.concatenate(
+                [values[:, :n_cols], values[:, -n_cols:]], axis=COMP_AX
+            )
+            columns = columns[:n_cols].append(columns[-n_cols:])
+        # aggregate samples
+        if self.n_samples > 1:
+            values = np.median(values, axis=SMPL_AX)
+        else:
+            values = values[:, :, 0]
+
+        df = pd.DataFrame(data=values, index=times, columns=columns, copy=False)
+        values_repr = getattr(df, f"to_{repr_type}")(
+            max_rows=max_rows, max_cols=max_cols
+        )
+
+        # additional information
+        info_str = f"shape: {self.shape}, freq: {self.freq_str}, size: {format_bytes(self._values.nbytes)}"
+
+        # notify when samples were aggregated
+        if self.n_samples > 1:
+            info_str += (
+                "<br>" if repr_type == "html" else "\n"
+            ) + "info: only sample median was displayed"
+        return values_repr, info_str
 
     def __copy__(self, deep: bool = True):
         return self.copy()
@@ -5496,17 +5645,15 @@ class TimeSeries:
 
     def __getitem__(
         self,
-        key: Union[
-            pd.DatetimeIndex,
-            pd.RangeIndex,
-            list[str],
-            list[int],
-            list[pd.Timestamp],
-            str,
-            int,
-            pd.Timestamp,
-            Any,
-        ],
+        key: pd.DatetimeIndex
+        | pd.RangeIndex
+        | list[str]
+        | list[int]
+        | list[pd.Timestamp]
+        | str
+        | int
+        | pd.Timestamp
+        | Any,
     ) -> Self:
         """Return a new series with elements selected by `key`.
 
@@ -5558,7 +5705,7 @@ class TimeSeries:
         )
 
         # handle DatetimeIndex and RangeIndex:
-        if isinstance(key, (pd.DatetimeIndex, pd.RangeIndex)):
+        if isinstance(key, TimeIndex):
             is_dti = isinstance(key, pd.DatetimeIndex)
             _check_dt() if is_dti else _check_range()
             times = self._time_index
@@ -5627,8 +5774,8 @@ class TimeSeries:
                     hierarchy=None,
                     metadata=self.metadata,
                 )
-            elif isinstance(key.start, (int, np.int64)) or isinstance(
-                key.stop, (int, np.int64)
+            elif isinstance(key.start, int | np.int64) or isinstance(
+                key.stop, int | np.int64
             ):
                 return self.__class__(
                     times=self._time_index[key],
@@ -5690,7 +5837,7 @@ class TimeSeries:
                 hierarchy=None,
                 metadata=self.metadata,
             )
-        elif isinstance(key, (int, np.int64)):
+        elif isinstance(key, int | np.int64):
             key = slice(key, key + 1 if key != -1 else None)
             ts = self.__class__(
                 times=self._time_index[key],
@@ -5736,13 +5883,31 @@ class TimeSeries:
                     hierarchy=None,
                     metadata=self.metadata,
                 )
-            elif all(isinstance(i, (int, np.int64)) for i in key):
-                return self.__class__(
-                    times=self._time_index[key],
-                    values=self._values[key],
-                    components=self.components,
-                    **self._attrs,
-                )
+            elif all(isinstance(i, int | np.int64) for i in key):
+                # convert list of integers to slice (must have constant step size)
+                step_sizes = set(right - left for left, right in zip(key[:-1], key[1:]))
+                if len(step_sizes) > 1:
+                    raise_log(
+                        ValueError(
+                            f"Cannot index a `TimeSeries` with a list of integers with non-constant step sizes. "
+                            f"Observed step sizes: `{step_sizes}`."
+                        ),
+                        logger,
+                    )
+                elif len(step_sizes) == 1:
+                    step_size = step_sizes.pop()
+                else:
+                    step_size = 1
+
+                if step_size <= 0:
+                    raise_log(
+                        ValueError(
+                            "Indexing a `TimeSeries` with a list of integers with `step<=0` is not "
+                            "possible since `TimeSeries` must have a monotonically increasing time index."
+                        ),
+                        logger=logger,
+                    )
+                return self[key[0] : key[-1] + step_size : step_size]
 
             elif all(isinstance(t, pd.Timestamp) for t in key):
                 _check_dt()
@@ -5757,7 +5922,7 @@ class TimeSeries:
         raise_log(IndexError("The type of your index was not matched."), logger)
 
 
-def _concat_static_covs(series: Sequence[TimeSeries]) -> Optional[pd.DataFrame]:
+def _concat_static_covs(series: Sequence[TimeSeries]) -> pd.DataFrame | None:
     """Concatenate static covariates along the component axis (rows of static covariates). Use this for stacking or
     concatenating time series along component dimension (axis=1).
 
@@ -5831,39 +5996,39 @@ def _concat_hierarchy(series: Sequence[TimeSeries]):
 
 def concatenate(
     series: Sequence[TimeSeries],
-    axis: Union[str, int] = 0,
+    axis: str | int = 0,
     ignore_time_axis: bool = False,
     ignore_static_covariates: bool = False,
     drop_hierarchy: bool = True,
     drop_metadata: bool = False,
-):
-    """Concatenate multiple series along a given axis.
+) -> TimeSeries:
+    """Concatenates multiple series along a given axis.
 
     ``axis`` can be an integer in (0, 1, 2) to denote (time, component, sample) or, alternatively, a string denoting
     the corresponding dimension of the underlying ``DataArray``.
 
     Parameters
     ----------
-    series : Sequence[TimeSeries]
+    series
         Sequence of ``TimeSeries`` to concatenate.
-    axis : Union[str, int]
+    axis
         Axis along which the series will be concatenated.
-    ignore_time_axis : bool
+    ignore_time_axis
         Allow concatenation even when some series do not have matching time axes.
         When done along component or sample dimensions, concatenation will work as long as the series
         have the same lengths (in this case the resulting series will have the time axis of the first
         provided series). When done along time dimension, concatenation will work even if the time axes
         are not contiguous (in this case, the resulting series will have a start time matching the start time
         of the first provided series). Default: False.
-    ignore_static_covariates : bool
+    ignore_static_covariates
         Whether to ignore all requirements for static covariate concatenation and only transfer the static covariates
         of the first TimeSeries element in `series` to the concatenated TimeSeries. Only effective when `axis=1`.
-    drop_hierarchy : bool
+    drop_hierarchy
         When `axis=1`, whether to drop hierarchy information. True by default. When False, the hierarchies will be
         "concatenated" as well (by merging the hierarchy dictionaries), which may cause issues if the component
         names of the resulting series and that of the merged hierarchy do not match.
         When `axis=0` or `axis=2`, the hierarchy of the first series is always kept.
-    drop_metadata : bool
+    drop_metadata
         Whether to drop the metadata information of the concatenated series. False by default.
         When False, the concatenated series will inherit the metadata from the first TimeSeries element in `series`.
 
@@ -5872,6 +6037,9 @@ def concatenate(
     TimeSeries
         The concatenated series.
     """
+    if isinstance(series, TimeSeries):
+        series = [series]
+
     axis = TimeSeries._get_axis(axis)
     vals = [ts.all_values(copy=False) for ts in series]
 
@@ -5969,11 +6137,11 @@ def concatenate(
 
 
 def slice_intersect(series: Sequence[TimeSeries]) -> list[TimeSeries]:
-    """Return a list of series, where all series have been intersected along the time index.
+    """Returns a list of series, where all series have been intersected along the time index.
 
     Parameters
     ----------
-    series : Sequence[TimeSeries]
+    series
         sequence of ``TimeSeries`` to intersect
 
     Returns
@@ -5997,9 +6165,90 @@ def slice_intersect(series: Sequence[TimeSeries]) -> list[TimeSeries]:
     return series_intersected
 
 
+def to_group_dataframe(
+    series: Sequence[TimeSeries],
+    copy: bool = True,
+    backend: ModuleType | Implementation | str = Implementation.PANDAS,
+    time_as_index: bool = True,
+    suppress_warnings: bool = False,
+    add_static_covariates: bool | str | list[str] = True,
+    add_metadata: bool | str | list[str] = False,
+    add_group_col: bool | str = False,
+):
+    """Converts a sequence of `TimeSeries` into a long DataFrame representation.
+
+    It converts each series into individual DataFrames and then concatenates them row-wise into a long DataFrame
+    using the specified backend.
+
+    This is particularly useful when working with collections of time series that share a common schema
+    and need to be represented in a tabular format for downstream processing.
+
+    Parameters
+    ----------
+    series
+        A sequence of `TimeSeries` to convert into a long DataFrame.
+    copy
+        Whether to return a copy of the resulting DataFrame. Leave it to True unless you know what you are doing.
+    backend
+        The backend to which to export the `TimeSeries`. See the `narwhals documentation
+        <https://narwhals-dev.github.io/narwhals/api-reference/narwhals/#narwhals.from_dict>`__ for all supported
+        backends.
+    time_as_index
+        Whether to set the time index as the index of the DataFrame or in the left-most column.
+        Only effective with the pandas `backend`.
+    suppress_warnings
+        Whether to suppress warnings raised during the DataFrame creation.
+    add_static_covariates
+        Whether to add the series' static covariates to the resulting DataFrame (one column per component-static
+        covariate pair). If a bool, controls whether to add all static covariates or none. If a string, or list of
+        strings, specifies the subset of static covariate columns / names to add.
+    add_metadata
+        Whether to add the series' metadata to the resulting DataFrame (one column per metadata entry). If a bool,
+        controls whether to add all metadata entries or none. If a string, or list of strings, specifies the subset
+        of metadata keys / names to add.
+    add_group_col
+        Whether to add a integer group column to the resulting DataFrame that serves as a mapping between DataFrame
+        rows and their corresponding time series. If a bool, indicates whether to add a group column with the name
+        "group". If a string, adds a group column with the name being that string value.
+
+    Returns
+    -------
+    DataFrame
+        A long DataFrame representation of the input sequence of `TimeSeries` in the specified `backend`.
+    """
+
+    backend = Implementation.from_backend(backend)
+
+    if isinstance(series, TimeSeries):
+        series = [series]
+
+    df = []
+    group_col = add_group_col if isinstance(add_group_col, str) else "group"
+    for idx, series_ in enumerate(series):
+        df_ = series_.to_dataframe(
+            copy=copy,
+            backend=backend,
+            time_as_index=time_as_index,
+            suppress_warnings=suppress_warnings,
+            add_static_covariates=add_static_covariates,
+            add_metadata=add_metadata,
+        )
+        df_ = nw.from_native(df_)
+        if add_group_col:
+            df_ = df_.with_columns(nw.lit(idx).alias(group_col))
+        df.append(df_)
+
+    df = nw.concat(df).to_native()
+
+    # pandas keeps the row index of each df, reset it here if it does not represent the time index
+    if backend.is_pandas() and not time_as_index:
+        df.reset_index(inplace=True, drop=True)
+    return df
+
+
 def _finite_rows_boundaries(
     values: np.ndarray, how: str = "all"
-) -> tuple[Optional[int], Optional[int]]:
+) -> tuple[int | None, int | None]:
     """Return the indices of the first rows containing finite values starting from the start and the end of the first
     dimension of the ndarray.
 
@@ -6062,3 +6311,8 @@ def _clean_components(components: pd.Index) -> pd.Index:
         has_duplicate = len(set(clist)) != len(clist)
 
     return pd.Index(clist)
+
+
+def _is_xarray(obj) -> bool:
+    """Check if *obj* is an xarray type without importing xarray."""
+    return type(obj).__module__.startswith("xarray")

@@ -1,10 +1,9 @@
 """
-Croston method
+Croston Method
 --------------
 """
 
 import copy
-from typing import Optional
 
 from statsforecast.models import TSB as CrostonTSB
 from statsforecast.models import CrostonClassic, CrostonOptimized, CrostonSBA
@@ -19,21 +18,21 @@ class Croston(StatsForecastModel):
     def __init__(
         self,
         version: str = "classic",
-        alpha_d: float = None,
-        alpha_p: float = None,
-        add_encoders: Optional[dict] = None,
-        quantiles: Optional[list[float]] = None,
-        random_state: Optional[int] = None,
+        alpha_d: float | None = None,
+        alpha_p: float | None = None,
+        add_encoders: dict | None = None,
+        quantiles: list[float] | None = None,
+        random_state: int | None = None,
         **kwargs,
     ):
-        """Croston method as presented `in this paper <https://otexts.com/fpp3/counts.html>`_ and based on the
-        `Statsforecasts package <https://github.com/Nixtla/statsforecast>`_.
+        """Croston method as presented `in this paper <https://otexts.com/fpp3/counts.html>`__ and based on the
+        `Statsforecasts package <https://github.com/Nixtla/statsforecast>`__.
 
         We refer to the StatsForecast documentation of
-        `CrostonClassic <https://nixtlaverse.nixtla.io/statsforecast/src/core/models.html#crostonclassic>`_,
-        `CrostonOptimized <https://nixtlaverse.nixtla.io/statsforecast/src/core/models.html#crostonoptimized>`_,
-        `CrostonSBA <https://nixtlaverse.nixtla.io/statsforecast/src/core/models.html#crostonsba>`_, and
-        `Teunter-Syntetos-Babai <https://nixtlaverse.nixtla.io/statsforecast/src/core/models.html#tsb>`_.
+        `CrostonClassic <https://nixtlaverse.nixtla.io/statsforecast/src/core/models.html#crostonclassic>`__,
+        `CrostonOptimized <https://nixtlaverse.nixtla.io/statsforecast/src/core/models.html#crostonoptimized>`__,
+        `CrostonSBA <https://nixtlaverse.nixtla.io/statsforecast/src/core/models.html#crostonsba>`__, and
+        `Teunter-Syntetos-Babai <https://nixtlaverse.nixtla.io/statsforecast/src/core/models.html#tsb>`__.
 
         In addition to univariate deterministic forecasting, it comes with additional support:
 
@@ -41,7 +40,7 @@ class Croston(StatsForecastModel):
           Darts adds support by first regressing the series against the future covariates using a
           :class:`~darts.models.forecasting.linear_regression_model.LinearRegressionModel` model and then running the
           StatsForecast model on the in-sample residuals from this original regression. This approach was inspired by
-          `this post of Stephan Kolassa <https://stats.stackexchange.com/q/220885>`_.
+          `this post of Stephan Kolassa <https://stats.stackexchange.com/q/220885>`__.
 
         - **Probabilstic / Conformal forecasting:** Probabilstic forecasting can be performed using conformal
           prediction. To activate it, simply set `prediction_intervals` at model creation. To generate probabilistic
@@ -131,13 +130,13 @@ class Croston(StatsForecastModel):
         >>> model = Croston(version="optimized")
         >>> model.fit(series, future_covariates=future_cov)
         >>> pred = model.predict(6, future_covariates=future_cov)
-        >>> pred.values()
-        array([[419.84565922],
-               [424.06484452],
-               [440.05509455],
-               [463.53183473],
-               [488.20449148],
-               [507.46204636]])
+        >>> print(pred.values())
+        [[419.84565922]
+         [424.06484452]
+         [440.05509455]
+         [463.53183473]
+         [488.20449148]
+         [507.46204636]]
         """
         if version.lower() not in ["classic", "optimized", "sba", "tsb"]:
             raise_log(

@@ -1,56 +1,43 @@
+import importlib.util
 import logging
 import os
 import shutil
 import tempfile
+from typing import Any
+from unittest.mock import patch
 
+import pandas as pd
 import pytest
+from packaging import version
 
 from darts.logging import get_logger
 
 logger = get_logger(__name__)
 
-try:
-    import torch  # noqa: F401
+PANDAS_30_OR_GREATER = version.parse(pd.__version__) >= version.parse("3.0.0")
 
-    TORCH_AVAILABLE = True
-except ImportError:
-    logger.warning("Torch not installed - Some tests will be skipped.")
-    TORCH_AVAILABLE = False
 
-try:
-    import onnx  # noqa: F401
-    import onnxruntime  # noqa: F401
+def _package_available(*names: str) -> bool:
+    return all(importlib.util.find_spec(n) is not None for n in names)
 
-    ONNX_AVAILABLE = True
-except ImportError:
-    logger.warning("Onnx not installed - Some tests will be skipped.")
-    ONNX_AVAILABLE = False
 
-try:
-    import optuna  # noqa: F401
+TORCH_AVAILABLE = _package_available("torch")
+GBM_AVAILABLE = _package_available("catboost", "lightgbm", "xgboost")
+XGB_AVAILABLE = _package_available("xgboost")
+LGBM_AVAILABLE = _package_available("lightgbm")
+CB_AVAILABLE = _package_available("catboost")
+PROPHET_AVAILABLE = _package_available("prophet")
+SF_AVAILABLE = _package_available("statsforecast")
+NF_AVAILABLE = _package_available("neuralforecast")
+ONNX_AVAILABLE = _package_available("onnx", "onnxruntime")
+OPTUNA_AVAILABLE = _package_available("optuna")
+RAY_AVAILABLE = _package_available("ray")
+POLARS_AVAILABLE = _package_available("polars")
+PLOTLY_AVAILABLE = _package_available("plotly")
+IPYTHON_AVAILABLE = _package_available("IPython")
+TIREX_AVAILABLE = _package_available("tirex")
 
-    OPTUNA_AVAILABLE = True
-except ImportError:
-    logger.warning("Optuna not installed - Some tests will be skipped.")
-    OPTUNA_AVAILABLE = False
-
-try:
-    import ray  # noqa: F401
-
-    RAY_AVAILABLE = True
-except ImportError:
-    logger.warning("Ray not installed - Some tests will be skipped.")
-    RAY_AVAILABLE = False
-
-try:
-    import polars  # noqa: F401
-
-    POLARS_AVAILABLE = True
-except ImportError:
-    logger.warning("Polars not installed - Some tests will be skipped.")
-    POLARS_AVAILABLE = False
-
-tfm_kwargs = {
+tfm_kwargs: dict[str, Any] = {
     "pl_trainer_kwargs": {
         "accelerator": "cpu",
         "enable_progress_bar": False,
@@ -111,3 +98,13 @@ def tmpdir_fn():
     os.chdir(cwd)
     # remove temp dir
     shutil.rmtree(temp_work_dir)
+
+
+@pytest.fixture(scope="function")
+def mpl_safe_plotting():
+    """Patches plt.show() and closes all plots / figures from memory at the end of the test."""
+    import matplotlib.pyplot as plt
+
+    with patch("matplotlib.pyplot.show") as patched_show:
+        yield patched_show
+    plt.close("all")

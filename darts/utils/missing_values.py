@@ -3,8 +3,6 @@ Utils for filling missing values
 --------------------------------
 """
 
-from typing import Optional, Union
-
 from darts import TimeSeries
 from darts.logging import get_logger, raise_if, raise_if_not
 
@@ -30,7 +28,7 @@ def missing_values_ratio(series: TimeSeries) -> float:
 
 
 def fill_missing_values(
-    series: TimeSeries, fill: Union[str, float] = "auto", **interpolate_kwargs
+    series: TimeSeries, fill: str | float = "auto", **interpolate_kwargs
 ) -> TimeSeries:
     """
     Fills missing values in the provided time series
@@ -45,7 +43,7 @@ def fill_missing_values(
     interpolate_kwargs
         Keyword arguments for `pandas.Dataframe.interpolate()`, only used when fit is set to 'auto'.
         See `the documentation
-        <https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.interpolate.html>`_
+        <https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.interpolate.html>`__
         for the list of supported parameters.
 
     Returns
@@ -70,7 +68,7 @@ def fill_missing_values(
 
 
 def extract_subseries(
-    series: TimeSeries, min_gap_size: Optional[int] = 1, mode: str = "all"
+    series: TimeSeries, min_gap_size: int | None = 1, mode: str = "all"
 ) -> list[TimeSeries]:
     """
     Partitions the series into a sequence of sub-series by using significant gaps of missing values
@@ -161,7 +159,7 @@ def _auto_fill(series: TimeSeries, **interpolate_kwargs) -> TimeSeries:
     interpolate_kwargs
         Keyword arguments for `pandas.Dataframe.interpolate()`.
         See `the documentation
-        <https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.interpolate.html>`_
+        <https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.interpolate.html>`__
         for the list of supported parameters.
     Returns
     -------

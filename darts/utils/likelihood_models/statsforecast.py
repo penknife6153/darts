@@ -1,9 +1,7 @@
 """
-Likelihoods for `StatsForecast` Models
---------------------------------------
+Likelihoods for StatsForecastModel
+----------------------------------
 """
-
-from abc import ABC
 
 import numpy as np
 
@@ -18,7 +16,7 @@ from darts.utils.utils import _check_quantiles, sample_from_quantiles
 logger = get_logger(__name__)
 
 
-class QuantilePrediction(Likelihood, ABC):
+class QuantilePrediction(Likelihood):
     def __init__(self, quantiles: list[float]):
         """Quantile Prediction Likelihood
 

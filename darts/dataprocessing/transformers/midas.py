@@ -3,8 +3,8 @@ Mixed-data sampling (MIDAS) Transformer
 ---------------------------------------
 """
 
-from collections.abc import Mapping, Sequence
-from typing import Any, Optional, Union
+from collections.abc import Mapping
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,7 @@ from darts.dataprocessing.transformers import (
 )
 from darts.logging import get_logger, raise_log
 from darts.timeseries import DEFAULT_GLOBAL_STATIC_COV_NAME, _finite_rows_boundaries
+from darts.typing import TimeIndex, TimeSeriesLike
 from darts.utils.utils import generate_index
 
 logger = get_logger(__name__)
@@ -73,28 +74,34 @@ class MIDAS(FittableDataTransformer, InvertibleDataTransformer):
         >>> from darts.dataprocessing.transformers import MIDAS
         >>> monthly_series = AirPassengersDataset().load()
         >>> print(monthly_series.time_index[:4])
-        DatetimeIndex(['1949-01-01', '1949-02-01', '1949-03-01', '1949-04-01'], dtype='datetime64[ns]',
-        name='Month', freq='MS')
+        DatetimeIndex(['1949-01-01', '1949-02-01', '1949-03-01', '1949-04-01'], dtype='datetime64[ns]', name='Month', freq='MS')
         >>> print(monthly_series.values()[:4])
-        [[112.], [118.], [132.], [129.]]
+        [[112.]
+         [118.]
+         [132.]
+         [129.]]
         >>> midas = MIDAS(low_freq="QS")
         >>> quarterly_series = midas.fit_transform(monthly_series)
         >>> print(quarterly_series.time_index[:3])
         DatetimeIndex(['1949-01-01', '1949-04-01', '1949-07-01'], dtype='datetime64[ns]', name='Month', freq='QS-JAN')
         >>> print(quarterly_series.values()[:3])
-        [[112. 118. 132.], [129. 121. 135.], [148. 148. 136.]]
+        [[112. 118. 132.]
+         [129. 121. 135.]
+         [148. 148. 136.]]
         >>> inversed_quaterly = midas.inverse_transform(quarterly_series)
         >>> print(inversed_quaterly.time_index[:4])
-        DatetimeIndex(['1949-01-01', '1949-02-01', '1949-03-01', '1949-04-01'], dtype='datetime64[ns]',
-        name='time', freq='MS')
+        DatetimeIndex(['1949-01-01', '1949-02-01', '1949-03-01', '1949-04-01'], dtype='datetime64[ns]', name='Month', freq='MS')
         >>> print(inversed_quaterly.values()[:4])
-        [[112.], [118.], [132.], [129.]]
+        [[112.]
+         [118.]
+         [132.]
+         [129.]]
 
         References
         ----------
         .. [1] https://en.wikipedia.org/wiki/Mixed-data_sampling
         .. [2] https://pandas.pydata.org/docs/user_guide/timeseries.html#dateoffset-objects
-        """
+        """  # noqa: E501
         if pd.tseries.frequencies.get_period_alias(low_freq) is None:
             raise_log(
                 ValueError(
@@ -112,11 +119,11 @@ class MIDAS(FittableDataTransformer, InvertibleDataTransformer):
 
     @staticmethod
     def ts_fit(
-        series: Union[TimeSeries, Sequence[TimeSeries]],
+        series: TimeSeriesLike,
         params: Mapping[str, Any],
         *args,
         **kwargs,
-    ) -> Union[dict[str, Any], list[dict[str, Any]]]:
+    ) -> dict[str, Any] | list[dict[str, Any]]:
         """MIDAS needs the high frequency period name in order to easily reverse_transform
         TimeSeries, the parallelization is handled by `transform` and/or `inverse_transform`
         (see InvertibleDataTransformer.__init__() docstring).
@@ -164,6 +171,10 @@ class MIDAS(FittableDataTransformer, InvertibleDataTransformer):
             (3) Replace input series by unsampled series if it's not 'full'
             (4) Transform every column of the high frequency series into multiple columns for the low frequency series
             (5) Transform the low frequency series back into a TimeSeries
+
+        References
+        ----------
+        .. [1] https://en.wikipedia.org/wiki/Mixed-data_sampling
         """
         low_freq = params["fixed"]["_low_freq"]
         strip = params["fixed"]["_strip"]
@@ -311,6 +322,7 @@ class MIDAS(FittableDataTransformer, InvertibleDataTransformer):
     def ts_inverse_transform(
         series: TimeSeries,
         params: Mapping[str, Any],
+        insample: TimeSeries | None = None,
     ) -> TimeSeries:
         """
         Transforms series back to high frequency by retrieving the original high frequency and reshaping the values.
@@ -396,8 +408,8 @@ class MIDAS(FittableDataTransformer, InvertibleDataTransformer):
     @staticmethod
     def _verify_series(
         series: TimeSeries,
-        high_freq: Optional[str] = None,
-        low_freq: Optional[str] = None,
+        high_freq: str | None = None,
+        low_freq: str | None = None,
     ):
         """Some sanity checks on the input, the high_freq and low_freq arguments are mutually exclusive"""
         if not isinstance(series.time_index, pd.DatetimeIndex):
@@ -435,7 +447,7 @@ class MIDAS(FittableDataTransformer, InvertibleDataTransformer):
         n_midas: int,
         drop_static_covariates: bool,
         inverse_transform: bool,
-    ) -> Optional[Union[pd.Series, pd.DataFrame]]:
+    ) -> pd.Series | pd.DataFrame | None:
         """
         If static covariates are component-specific, they must be reshaped appropriately.
         """
@@ -458,7 +470,7 @@ class MIDAS(FittableDataTransformer, InvertibleDataTransformer):
     def _create_midas_df(
         series: TimeSeries,
         arr: np.ndarray,
-        time_index: Union[pd.DatetimeIndex, pd.RangeIndex],
+        time_index: TimeIndex,
         n_midas: int,
         drop_static_covariates: bool,
         inverse_transform: bool,

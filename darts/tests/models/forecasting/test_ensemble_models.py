@@ -9,7 +9,7 @@ import pytest
 from darts import TimeSeries
 from darts.logging import get_logger
 from darts.models import (
-    AutoARIMA,
+    ARIMA,
     ExponentialSmoothing,
     LinearRegressionModel,
     NaiveDrift,
@@ -71,23 +71,28 @@ class TestEnsembleModels:
         global_model.fit(self.series1)
 
         # local and global trained
-        with pytest.raises(ValueError):
+        expteced_msg = "Using pre-trained models is only supported if all models are of type `GlobalForecastingModel`"
+        with pytest.raises(ValueError, match=expteced_msg):
             NaiveEnsembleModel([local_model, global_model])
 
         # local untrained, global trained
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=expteced_msg):
             NaiveEnsembleModel([local_model.untrained_model(), global_model])
 
         # local trained, global untrained
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=expteced_msg):
             NaiveEnsembleModel([local_model, global_model.untrained_model()])
 
         # global trained, global untrained
-        with pytest.raises(ValueError):
+        with pytest.raises(
+            ValueError, match="there is a mixture of fitted and unfitted models."
+        ):
             NaiveEnsembleModel([global_model, global_model.untrained_model()])
 
         # both global trained, retrain = True
-        with pytest.raises(ValueError):
+        with pytest.raises(
+            ValueError, match="some `forecasting_models` were already fitted."
+        ):
             # models need to be explicitly reset before retraining them
             NaiveEnsembleModel(
                 [global_model, global_model], train_forecasting_models=True
@@ -96,8 +101,11 @@ class TestEnsembleModels:
             [global_model.untrained_model(), global_model.untrained_model()],
             train_forecasting_models=True,
         )
-        with pytest.raises(ValueError):
+        with pytest.raises(
+            ValueError, match="The model must be fit before calling predict()"
+        ):
             model_ens_retrain.predict(1, series=self.series1)
+
         model_ens_retrain.fit(self.series1)
         model_ens_retrain.predict(1, series=self.series1)
 
@@ -106,6 +114,19 @@ class TestEnsembleModels:
             [global_model, global_model], train_forecasting_models=False
         )
         model_ens_no_retrain.predict(1, series=self.series1)
+
+        # global untrained, global untrained, retrain = False
+        with pytest.raises(
+            ValueError,
+            match=(
+                "`train_forecasting_models=False` is supported only if all "
+                "the `forecasting_models` are already trained `GlobalForecastingModels`"
+            ),
+        ):
+            NaiveEnsembleModel(
+                [global_model.untrained_model(), global_model.untrained_model()],
+                train_forecasting_models=False,
+            )
 
     def test_extreme_lag_inference(self):
         ensemble = NaiveEnsembleModel([NaiveDrift()])
@@ -117,7 +138,6 @@ class TestEnsembleModels:
             None,
             None,
             0,
-            None,
         )  # test if default is okay
 
         model1 = LinearRegressionModel(
@@ -131,20 +151,89 @@ class TestEnsembleModels:
             model1,
             model2,
         ])  # test if infers extreme lags is okay
-        expected = (-5, 0, -6, -1, 6, 9, 0, None)
+        expected = (-5, 0, -6, -1, 6, 9, 0)
         assert expected == ensemble.extreme_lags
+
+    def test_min_train_samples(self):
+        """min_train_samples of the ensemble should be the max of the individual models"""
+        # local models require at least one sample
+        model1 = NaiveSeasonal(K=5)
+        ensemble = NaiveEnsembleModel([model1])
+        assert ensemble.min_train_samples == model1.min_train_samples
+
+        # regression models require at least two samples
+        model2 = LinearRegressionModel(lags=10, output_chunk_length=1)
+        ensemble = NaiveEnsembleModel([model1, model2])
+        assert ensemble.min_train_samples == model2.min_train_samples
+
+        ensemble = NaiveEnsembleModel([model2, model1])
+        assert ensemble.min_train_samples == model2.min_train_samples
+
+    def test_train_window_lengths(self):
+        """Each element in target_window_lengths (input and output windows) of the ensemble should be the max of the
+        individual models."""
+        # model 1 has largest input and output windows
+        model1 = NaiveSeasonal(K=5)
+        lenghts1 = model1._target_window_lengths
+        ensemble = NaiveEnsembleModel([model1])
+        assert ensemble._target_window_lengths == lenghts1
+
+        # model 2 has largest input and output windows
+        model2 = LinearRegressionModel(lags=10, output_chunk_length=1)
+        lenghts2 = model2._target_window_lengths
+        ensemble = NaiveEnsembleModel([model1, model2])
+        assert ensemble._target_window_lengths == lenghts2
+
+        ensemble = NaiveEnsembleModel([model2, model1])
+        assert ensemble._target_window_lengths == lenghts2
+
+        # model 3 has largest output window
+        model3 = LinearRegressionModel(lags=1, output_chunk_length=10)
+        lenghts3 = model3._target_window_lengths
+        ensemble = NaiveEnsembleModel([model2, model1, model3])
+        assert ensemble._target_window_lengths == (lenghts2[0], lenghts3[1])
+
+    def test_min_train_series_lengths(self):
+        """min_train_series_length of the ensemble should be
+        `sum(_train_target_sample_lengths) + _min_train_samples - 1`
+        """
+        # model 1 has largest input and output windows
+        model1 = NaiveSeasonal(K=5)
+        ensemble = NaiveEnsembleModel([model1])
+        assert ensemble.min_train_series_length == model1.min_train_series_length
+
+        # model 2 has largest input and output windows
+        model2 = LinearRegressionModel(lags=10, output_chunk_length=1)
+        ensemble = NaiveEnsembleModel([model1, model2])
+        assert ensemble.min_train_series_length == model2.min_train_series_length
+
+        ensemble = NaiveEnsembleModel([model2, model1])
+        assert ensemble.min_train_series_length == model2.min_train_series_length
+
+        # model2 and model3 have the same training lengths but input and output windows are different
+        model3 = LinearRegressionModel(lags=1, output_chunk_length=10)
+        ensemble = NaiveEnsembleModel([model2, model1, model3])
+        # (max(lags) + max(ocl)) + (min_train_samples - 1)
+        assert ensemble.min_train_series_length == (10 + 10) + (2 - 1)
 
     @pytest.mark.skipif(not TORCH_AVAILABLE, reason="requires torch")
     def test_extreme_lags_rnn(self):
-        # RNNModel has the 8th element in `extreme_lags` for the `max_target_lag_train`.
-        # it is given by `training_length - input_chunk_length`.
-        # for the ensemble model we want the max lag of all forecasting models.
+        # RNNModel itself has a training length which will go through multiple samples / steps in one training sample;
+        # the ensemble input requirements are the max(icl), max(ocl=1) + max(training samples)
         model1 = RNNModel(input_chunk_length=14, training_length=24)
         model2 = RNNModel(input_chunk_length=12, training_length=37)
 
         ensemble = NaiveEnsembleModel([model1, model2])
-        expected = (-14, 0, None, None, -14, 0, 0, 37 - 12)
-        assert expected == ensemble.extreme_lags
+        expected_lags = (-14, 0, None, None, -14, 0, 0)
+        assert ensemble.extreme_lags == expected_lags
+
+        # max(train_length)=37 - icl(of that model)=12 + 1
+        expected_samples = (37 - 12) + 1
+        assert ensemble.min_train_samples == expected_samples
+
+        # max(icl)=14 + max(ocl)=1 + (expected_samples - 1)
+        expected_length = 14 + 1 + (expected_samples - 1)
+        assert ensemble.min_train_series_length == expected_length
 
     def test_input_models_local_models(self):
         with pytest.raises(ValueError):
@@ -178,7 +267,7 @@ class TestEnsembleModels:
     def test_call_backtest_naive_ensemble_local_models(self):
         ensemble = NaiveEnsembleModel([NaiveSeasonal(5), Theta(2, 5)])
         ensemble.fit(self.series1)
-        assert ensemble.extreme_lags == (-10, -1, None, None, None, None, 0, None)
+        assert ensemble.extreme_lags == (-10, -1, None, None, None, None, 0)
         ensemble.backtest(self.series1)
 
     def test_predict_univariate_ensemble_local_models(self):
@@ -331,9 +420,9 @@ class TestEnsembleModels:
         assert pred_ens.time_index == pred_mix_ens.time_index
         assert all(pred_ens.components == pred_mix_ens.components)
         assert (
-            pred_ens["sine_q0.05"].values()
-            < pred_ens["sine_q0.50"].values()
-            < pred_ens["sine_q0.95"].values()
+            pred_ens["sine_q0.050"].values()
+            < pred_ens["sine_q0.500"].values()
+            < pred_ens["sine_q0.950"].values()
         )
 
     @pytest.mark.skipif(not TORCH_AVAILABLE, reason="requires torch")
@@ -372,24 +461,24 @@ class TestEnsembleModels:
         assert all(
             pred_ens.components
             == [
-                "sine_q0.05",
-                "sine_q0.50",
-                "sine_q0.95",
-                "linear_q0.05",
-                "linear_q0.50",
-                "linear_q0.95",
+                "sine_q0.050",
+                "sine_q0.500",
+                "sine_q0.950",
+                "linear_q0.050",
+                "linear_q0.500",
+                "linear_q0.950",
             ]
         )
         assert all(pred_ens.components == pred_mix_ens.components)
         assert (
-            pred_ens["sine_q0.05"].values()
-            < pred_ens["sine_q0.50"].values()
-            < pred_ens["sine_q0.95"].values()
+            pred_ens["sine_q0.050"].values()
+            < pred_ens["sine_q0.500"].values()
+            < pred_ens["sine_q0.950"].values()
         )
         assert (
-            pred_ens["linear_q0.05"].values()
-            < pred_ens["linear_q0.50"].values()
-            < pred_ens["linear_q0.95"].values()
+            pred_ens["linear_q0.050"].values()
+            < pred_ens["linear_q0.500"].values()
+            < pred_ens["linear_q0.950"].values()
         )
 
     @pytest.mark.skipif(not TORCH_AVAILABLE, reason="requires torch")
@@ -453,10 +542,10 @@ class TestEnsembleModels:
 
     @pytest.mark.skipif(not TORCH_AVAILABLE, reason="requires torch")
     def test_call_predict_different_covariates_support(self):
-        # AutoARIMA support future covariates only
+        # ARIMA support future covariates only
         local_ensemble_one_covs = NaiveEnsembleModel([
             NaiveDrift(),
-            AutoARIMA(),
+            ARIMA(),
         ])
         with pytest.raises(ValueError):
             local_ensemble_one_covs.fit(self.series1, past_covariates=self.series2)
@@ -473,7 +562,7 @@ class TestEnsembleModels:
 
         # both models support future covariates only
         mixed_ensemble_future_covs = NaiveEnsembleModel([
-            AutoARIMA(),
+            ARIMA(),
             RNNModel(12, n_epochs=1, **tfm_kwargs),
         ])
         mixed_ensemble_future_covs.fit(self.series1, future_covariates=self.series2)
@@ -649,7 +738,7 @@ class TestEnsembleModels:
             with pytest.raises(AssertionError):
                 np.testing.assert_array_almost_equal(pred_w.values(), pred_nw.values())
 
-    @pytest.mark.parametrize("model_cls", [NaiveEnsembleModel, RegressionEnsembleModel])
+    @pytest.mark.parametrize("model_cls", [RegressionEnsembleModel, NaiveEnsembleModel])
     def test_invalid_sample_weight(self, model_cls):
         kwargs = {
             "forecasting_models": [
@@ -658,11 +747,13 @@ class TestEnsembleModels:
             ],
         }
         if issubclass(model_cls, RegressionEnsembleModel):
-            kwargs["regression_train_n_points"] = 3
+            kwargs["regression_train_n_points"] = 2
 
-        ts = TimeSeries.from_values(np.array([0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
         # weights too short
         model = model_cls(**copy.deepcopy(kwargs))
+        ts = TimeSeries.from_values(
+            np.array([float(i) for i in range(model.min_train_series_length)])
+        )
         with pytest.raises(ValueError) as err:
             model.fit(ts, sample_weight=ts[:-1])
         assert (
@@ -846,3 +937,43 @@ class TestEnsembleModels:
                 assert m.past_covariate_series is None
                 assert m.future_covariate_series is None
         assert model.predict(5) == clean_model.predict(5, self.series1 + self.series2)
+
+    def test_multivariate_support(self):
+        assert NaiveEnsembleModel([NaiveSeasonal(1)]).supports_multivariate
+        assert not NaiveEnsembleModel([ARIMA()]).supports_multivariate
+        assert not NaiveEnsembleModel([
+            NaiveSeasonal(1),
+            ARIMA(),
+        ]).supports_multivariate
+
+    def test_predict_lkl_params_naive_ensemble(self):
+        quantiles = [0.05, 0.50, 0.95]
+        # different likelihoods are not supported for likelihood parameter predictions
+        model = NaiveEnsembleModel([
+            LinearRegressionModel(
+                lags=[-1], likelihood="quantile", quantiles=quantiles
+            ),
+            LinearRegressionModel(lags=[-1], likelihood="poisson"),
+        ])
+        model.fit(self.series1)
+        with pytest.raises(
+            ValueError,
+            match=(
+                "`predict_likelihood_parameters=True` is only supported for "
+                "probabilistic models fitted with a likelihood."
+            ),
+        ):
+            _ = model.predict(n=1, predict_likelihood_parameters=True)
+
+        # with the same likelihoods it is supported
+        model = NaiveEnsembleModel([
+            LinearRegressionModel(
+                lags=[-1], likelihood="quantile", quantiles=quantiles
+            ),
+            LinearRegressionModel(
+                lags=[-1], likelihood="quantile", quantiles=quantiles
+            ),
+        ])
+        model.fit(self.series1)
+        pred = model.predict(n=1, predict_likelihood_parameters=True)
+        assert pred.shape == (1, self.series1.n_components * len(quantiles), 1)

@@ -1,12 +1,15 @@
 """
-This file contains abstract classes for deterministic and probabilistic PyTorch Lightning Modules
+Base Lightning Module
+---------------------
+
+Contains abstract classes for deterministic and probabilistic PyTorch Lightning Modules
 """
 
 import copy
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from functools import wraps
-from typing import Any, Optional, Union
+from typing import Any
 
 import pytorch_lightning as pl
 import torch
@@ -29,19 +32,22 @@ logger = get_logger(__name__)
 
 def io_processor(forward):
     """Applies some input / output processing to PLForecastingModule.forward.
-    Note that this wrapper must be added to each of PLForecastinModule's subclasses forward methods.
+
+    Note that this wrapper must be added to each of PLForecastingModule's subclasses forward methods.
     Here is an example how to add the decorator:
 
-    ```python
+    .. highlight:: python
+    .. code-block:: python
+
         @io_processor
         def forward(self, *args, **kwargs)
             pass
-    ```
+    ..
 
-    Applies
-    -------
-    Reversible Instance Normalization
-        normalizes batch input target features, and inverse transform the forward output back to the original scale
+    Current applications include:
+
+    - Reversible Instance Normalization: normalizes batch input target features, and inverse transform the forward
+      output back to the original scale. Activated with `use_reversible_instance_norm=True` at model creation.
     """
 
     @wraps(forward)
@@ -76,28 +82,31 @@ class PLForecastingModule(pl.LightningModule, ABC):
         input_chunk_length: int,
         output_chunk_length: int,
         output_chunk_shift: int = 0,
-        train_sample_shape: Optional[tuple] = None,
+        train_sample_shape: tuple | None = None,
         loss_fn: nn.modules.loss._Loss = nn.MSELoss(),
-        torch_metrics: Optional[
-            Union[torchmetrics.Metric, torchmetrics.MetricCollection]
-        ] = None,
-        likelihood: Optional[TorchLikelihood] = None,
-        optimizer_cls: torch.optim.Optimizer = torch.optim.Adam,
-        optimizer_kwargs: Optional[dict] = None,
-        lr_scheduler_cls: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-        lr_scheduler_kwargs: Optional[dict] = None,
-        use_reversible_instance_norm: bool = False,
+        torch_metrics: torchmetrics.Metric
+        | torchmetrics.MetricCollection
+        | Sequence[torchmetrics.Metric | torchmetrics.MetricCollection]
+        | dict[str, torchmetrics.Metric | torchmetrics.MetricCollection]
+        | None = None,
+        likelihood: TorchLikelihood | None = None,
+        optimizer_cls: type[torch.optim.Optimizer] = torch.optim.Adam,
+        optimizer_kwargs: dict | None = None,
+        lr_scheduler_cls: torch.optim.lr_scheduler._LRScheduler | None = None,
+        lr_scheduler_kwargs: dict | None = None,
+        use_reversible_instance_norm: bool | dict = False,
     ) -> None:
         """
         PyTorch Lightning-based Forecasting Module.
 
         This class is meant to be inherited to create a new PyTorch Lightning-based forecasting module.
         When subclassing this class, please make sure to add the following methods with the given signatures:
-            - :func:`PLForecastingModule.__init__()`
-            - :func:`PLForecastingModule.forward()`
-            - :func:`PLForecastingModule._process_input_batch()`
-            - :func:`PLForecastingModule._produce_train_output()`
-            - :func:`PLForecastingModule._get_batch_prediction()`
+
+        - :func:`PLForecastingModule.__init__()`
+        - :func:`PLForecastingModule.forward()`
+        - :func:`PLForecastingModule._process_input_batch()`
+        - :func:`PLForecastingModule._produce_train_output()`
+        - :func:`PLForecastingModule._get_batch_prediction()`
 
         In subclass `MyModel`'s :func:`__init__` function call ``super(MyModel, self).__init__(**kwargs)`` where
         ``kwargs`` are the parameters of :class:`PLForecastingModule`.
@@ -123,8 +132,8 @@ class PLForecastingModule(pl.LightningModule, ABC):
             This parameter will be ignored for probabilistic models if the ``likelihood`` parameter is specified.
             Default: ``torch.nn.MSELoss()``.
         torch_metrics
-            A torch metric or a ``MetricCollection`` used for evaluation. A full list of available metrics can be found
-            at https://torchmetrics.readthedocs.io/en/latest/. Default: ``None``.
+            A ``torchmetric.Metric`` or a ``MetricCollection`` used for evaluation. A full list of available metrics
+            can be found `here <https://torchmetrics.readthedocs.io/en/latest/>`__. Default: ``None``.
         likelihood
             One of Darts' :meth:`Likelihood <darts.utils.likelihood_models.torch.TorchLikelihood>` models to be used for
             probabilistic forecasts. Default: ``None``.
@@ -141,7 +150,9 @@ class PLForecastingModule(pl.LightningModule, ABC):
             Optionally, some keyword arguments for the PyTorch learning rate scheduler. Default: ``None``.
         use_reversible_instance_norm
             Whether to use reversible instance normalization `RINorm` against distribution shift as shown in [1]_.
-            It is only applied to the features of the target series and not the covariates.
+            It is only applied to the features of the target series and not the covariates. If ``True``,
+            applies ``RINorm`` with default hyperparameters. If a dictionary, defines the hyperparameters to construct
+            the ``RINorm``. Supported parameters are ``{"affine": bool, "eps": float}``. Default: ``False``.
 
         References
         ----------
@@ -170,8 +181,8 @@ class PLForecastingModule(pl.LightningModule, ABC):
         self.val_criterion = copy.deepcopy(loss_fn)
         # reduction will be set to `None` when calling `TFM.fit()` with sample weights;
         # reset the actual criterion in method `on_fit_end()`
-        self.train_criterion_reduction: Optional[str] = None
-        self.val_criterion_reduction: Optional[str] = None
+        self.train_criterion_reduction: str | None = None
+        self.val_criterion_reduction: str | None = None
 
         # by default models are deterministic (i.e. not probabilistic)
         self.likelihood = likelihood
@@ -197,18 +208,20 @@ class PLForecastingModule(pl.LightningModule, ABC):
 
         # reversible instance norm
         self.use_reversible_instance_norm = use_reversible_instance_norm
-        if use_reversible_instance_norm:
+        if use_reversible_instance_norm is True:
             self.rin = RINorm(input_dim=self.n_targets)
+        elif isinstance(use_reversible_instance_norm, dict):
+            self.rin = RINorm(input_dim=self.n_targets, **use_reversible_instance_norm)
         else:
             self.rin = None
 
         # initialize prediction parameters
-        self.pred_n: Optional[int] = None
-        self.pred_num_samples: Optional[int] = None
-        self.pred_roll_size: Optional[int] = None
-        self.pred_batch_size: Optional[int] = None
-        self.predict_likelihood_parameters: Optional[bool] = None
-        self.pred_mc_dropout: Optional[bool] = None
+        self.pred_n: int | None = None
+        self.pred_num_samples: int | None = None
+        self.pred_roll_size: int | None = None
+        self.pred_batch_size: int | None = None
+        self.predict_likelihood_parameters: bool | None = None
+        self.pred_mc_dropout: bool | None = None
 
     @property
     def first_prediction_index(self) -> int:
@@ -323,10 +336,10 @@ class PLForecastingModule(pl.LightningModule, ABC):
         self,
         batch: TorchInferenceBatch,
         batch_idx: int,
-        dataloader_idx: Optional[int] = None,
+        dataloader_idx: int | None = None,
     ) -> tuple[
         torch.Tensor,
-        Sequence[Optional[dict[str, Any]]],
+        Sequence[dict[str, Any] | None],
         Sequence[Any],
     ]:
         """performs the prediction step
@@ -568,7 +581,7 @@ class PLForecastingModule(pl.LightningModule, ABC):
         return x_past, future_covariates, static_covariates
 
     def _get_batch_prediction(
-        self, n: int, input_batch: tuple[Optional[torch.Tensor], ...], roll_size: int
+        self, n: int, input_batch: tuple[torch.Tensor | None, ...], roll_size: int
     ) -> torch.Tensor:
         """Generates batch predictions.
 
@@ -702,8 +715,8 @@ class PLForecastingModule(pl.LightningModule, ABC):
 
     @staticmethod
     def _sample_tiling(
-        input_data_tuple: tuple[Optional[torch.Tensor], ...], batch_sample_size
-    ) -> tuple[Optional[torch.Tensor], ...]:
+        input_data_tuple: tuple[torch.Tensor | None, ...], batch_sample_size
+    ) -> tuple[torch.Tensor | None, ...]:
         tiled_input_data = []
         for tensor in input_data_tuple:
             if tensor is not None:
@@ -784,7 +797,7 @@ class PLForecastingModule(pl.LightningModule, ABC):
         return self.current_epoch
 
     @property
-    def output_chunk_length(self) -> Optional[int]:
+    def output_chunk_length(self) -> int | None:
         """
         Number of time steps predicted at once by the model.
         """
@@ -792,20 +805,12 @@ class PLForecastingModule(pl.LightningModule, ABC):
 
     @staticmethod
     def configure_torch_metrics(
-        torch_metrics: Union[torchmetrics.Metric, torchmetrics.MetricCollection],
+        torch_metrics: torchmetrics.Metric
+        | torchmetrics.MetricCollection
+        | Sequence[torchmetrics.Metric | torchmetrics.MetricCollection]
+        | dict[str, torchmetrics.Metric | torchmetrics.MetricCollection],
     ) -> torchmetrics.MetricCollection:
         """process the torch_metrics parameter."""
-        if torch_metrics is None:
-            torch_metrics = torchmetrics.MetricCollection([])
-        elif isinstance(torch_metrics, torchmetrics.Metric):
-            torch_metrics = torchmetrics.MetricCollection([torch_metrics])
-        elif isinstance(torch_metrics, torchmetrics.MetricCollection):
-            pass
-        else:
-            raise_log(
-                AttributeError(
-                    "`torch_metrics` only accepts type torchmetrics.Metric or torchmetrics.MetricCollection"
-                ),
-                logger,
-            )
-        return torch_metrics
+        return torchmetrics.MetricCollection(
+            torch_metrics if torch_metrics is not None else []
+        )

@@ -1,11 +1,15 @@
 """
 Block Recurrent Neural Networks
 -------------------------------
+.. autoclass:: CustomBlockRNNModule
+   :members: forward
+   :no-inherited-members:
+   :no-undoc-members:
+   :no-special-members:
 """
 
 import inspect
 from abc import ABC, abstractmethod
-from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -15,7 +19,9 @@ from darts.models.forecasting.pl_forecasting_module import (
     PLForecastingModule,
     io_processor,
 )
-from darts.models.forecasting.torch_forecasting_model import PastCovariatesTorchModel
+from darts.models.forecasting.torch_forecasting_model import (
+    MixedCovariatesTorchModel,
+)
 from darts.utils.data.torch_datasets.utils import PLModuleInput, TorchTrainingSample
 
 logger = get_logger(__name__)
@@ -26,10 +32,11 @@ class CustomBlockRNNModule(PLForecastingModule, ABC):
         self,
         input_size: int,
         hidden_dim: int,
+        future_cov_dim: int,
         num_layers: int,
         target_size: int,
         nr_params: int,
-        num_layers_out_fc: Optional[list] = None,
+        num_layers_out_fc: list | None = None,
         dropout: float = 0.0,
         activation: str = "ReLU",
         **kwargs,
@@ -40,13 +47,13 @@ class CustomBlockRNNModule(PLForecastingModule, ABC):
 
         To create a new module, subclass from :class:`CustomBlockRNNModule` and:
 
-        * Define the architecture in the module constructor (`__init__()`)
+        * Define the architecture in the module constructor (``__init__()``)
 
-        * Add the `forward()` method and define the logic of your module's forward pass
+        * Add the ``forward()`` method and define the logic of your module's forward pass
 
-        * Use the custom module class when creating a new :class:`BlockRNNModel` with parameter `model`.
+        * Use the custom module class when creating a new :class:`BlockRNNModel` with parameter ``model``.
 
-        You can use `darts.models.forecasting.block_rnn_model._BlockRNNModule` as an example.
+        You can use ``darts.models.forecasting.block_rnn_model._BlockRNNModule`` as an example.
 
         Parameters
         ----------
@@ -54,6 +61,8 @@ class CustomBlockRNNModule(PLForecastingModule, ABC):
             The dimensionality of the input time series.
         hidden_dim
             The number of features in the hidden state `h` of the RNN module.
+        future_cov_dim
+            Number of future covariates.
         num_layers
             The number of recurrent layers.
         target_size
@@ -76,13 +85,13 @@ class CustomBlockRNNModule(PLForecastingModule, ABC):
         # Defining parameters
         self.input_size = input_size
         self.hidden_dim = hidden_dim
+        self.future_cov_dim = future_cov_dim
         self.num_layers = num_layers
         self.target_size = target_size
         self.nr_params = nr_params
         self.num_layers_out_fc = [] if num_layers_out_fc is None else num_layers_out_fc
         self.dropout = dropout
         self.activation = activation
-        self.out_len = self.output_chunk_length
 
     @io_processor
     @abstractmethod
@@ -109,7 +118,7 @@ class _BlockRNNModule(CustomBlockRNNModule):
     def __init__(
         self,
         name: str,
-        activation: Optional[str] = None,
+        activation: str | None = None,
         **kwargs,
     ):
         """PyTorch module implementing a block RNN to be used in `BlockRNNModel`.
@@ -160,12 +169,25 @@ class _BlockRNNModule(CustomBlockRNNModule):
             dropout=self.dropout,
         )
 
+        # Fully connected layer to map the output for each timestep in the input sequence (out) to the output chunk
+        # length
+        if self.output_chunk_length > self.input_chunk_length:
+            self.up_sampler = nn.Linear(
+                self.input_chunk_length, self.output_chunk_length
+            )
+        else:
+            self.up_sampler = None
+
+        if self.future_cov_dim > 0:
+            last = self.hidden_dim + self.future_cov_dim
+        else:
+            last = self.hidden_dim
+
         # The RNN module is followed by a fully connected layer, which maps the last hidden layer
         # to the output of desired length
-        last = self.hidden_dim
         feats = []
         for index, feature in enumerate(
-            self.num_layers_out_fc + [self.out_len * self.target_size * self.nr_params]
+            self.num_layers_out_fc + [self.nr_params * self.target_size]
         ):
             feats.append(nn.Linear(last, feature))
 
@@ -178,38 +200,77 @@ class _BlockRNNModule(CustomBlockRNNModule):
 
     @io_processor
     def forward(self, x_in: PLModuleInput):
-        x, _, _ = x_in
-        # data is of size (batch_size, input_chunk_length, input_size)
-        batch_size = x.size(0)
+        # B: batch size
+        # L: input chunk length
+        # T: output chunk length
+        # C: target components
+        # P: past cov features
+        # F: future cov features
+        # S: static cov features
+        # H = C + P + F: historic features
+        # H_D: hidden dim
+        # N_P: likelihood parameters
 
-        out, hidden = self.rnn(x)
+        # `x_past`: (B, L, H), `x_future`: (B, T, F), `x_static`: (B, C or 1 = C1, S)
+        x_past, x_future, x_static = x_in
 
-        """ Here, we apply the FC network only on the last output point (at the last time step)
-        """
-        if self.name == "LSTM":
-            hidden = hidden[0]
-        predictions = hidden[-1, :, :]
-        predictions = self.fc(predictions)
+        batch_size = x_past.shape[0]
+
+        # concatenate static covariates if given
+        if x_static is not None:
+            # -> (B, 1, C1 * S)
+            x_static = x_static.reshape(batch_size, -1).unsqueeze(dim=1)
+            # -> (B, L, C1 * S)
+            x_static = x_static.repeat(1, self.input_chunk_length, 1)
+            # -> (B, L, H + C1 * S)
+            x_past = torch.concat([x_past, x_static], dim=-1)
+
+        # -> (B, L, H_D)
+        out, _ = self.rnn(x_past)
+
+        # use the RNN output of length `T` as input for the FC
+        # -> (B, T, H_D)
+        if self.output_chunk_length > self.input_chunk_length:
+            # up-sample to `T` if history is too short
+            # -> (B, H_D, L)
+            out = out.permute(0, 2, 1)
+            # -> (B, H_D, T)
+            out = self.up_sampler(out)
+            # -> (B, T, H_D)
+            out = out.permute(0, 2, 1)
+        else:
+            # otherwise, take `T` last predictions
+            # -> (B, T, H_D)
+            out = out[:, -self.output_chunk_length :, :]
+
+        # concatenate future covariates if given
+        if x_future is not None:
+            # -> (B, T, H_D + F)
+            out = torch.cat([out, x_future], dim=-1)
+
+        # predict using the FC
+        # -> (B, T, C * N_P)
+        predictions = self.fc(out)
+        # -> (B, T, C, N_P)
         predictions = predictions.view(
-            batch_size, self.out_len, self.target_size, self.nr_params
+            batch_size, self.output_chunk_length, self.target_size, self.nr_params
         )
-
-        # predictions is of size (batch_size, output_chunk_length, 1)
         return predictions
 
 
-class BlockRNNModel(PastCovariatesTorchModel):
+class BlockRNNModel(MixedCovariatesTorchModel):
     def __init__(
         self,
         input_chunk_length: int,
         output_chunk_length: int,
         output_chunk_shift: int = 0,
-        model: Union[str, type[CustomBlockRNNModule]] = "RNN",
+        model: str | type[CustomBlockRNNModule] = "RNN",
         hidden_dim: int = 25,
         n_rnn_layers: int = 1,
-        hidden_fc_sizes: Optional[list] = None,
+        hidden_fc_sizes: list | None = None,
         dropout: float = 0.0,
         activation: str = "ReLU",
+        use_static_covariates: bool = True,
         **kwargs,
     ):
         """Block Recurrent Neural Network Model (RNNs).
@@ -261,6 +322,10 @@ class BlockRNNModel(PastCovariatesTorchModel):
         activation
             The name of a torch.nn activation function to be applied between the layers of the fully connected network.
             Default: "ReLU".
+        use_static_covariates
+            Whether the model should use static covariate information in case the input `series` passed to ``fit()``
+            contain static covariates. If ``True``, and static covariates are available at fitting time, will enforce
+            that all target `series` have the same static covariate dimensionality in ``fit()`` and ``predict()``.
         **kwargs
             Optional arguments to initialize the pytorch_lightning.Module, pytorch_lightning.Trainer, and
             Darts' :class:`TorchForecastingModel`.
@@ -288,7 +353,9 @@ class BlockRNNModel(PastCovariatesTorchModel):
             Optionally, some keyword arguments for the PyTorch learning rate scheduler. Default: ``None``.
         use_reversible_instance_norm
             Whether to use reversible instance normalization `RINorm` against distribution shift as shown in [1]_.
-            It is only applied to the features of the target series and not the covariates.
+            It is only applied to the features of the target series and not the covariates. If ``True``,
+            applies ``RINorm`` with default hyperparameters. If a dictionary, defines the hyperparameters to construct
+            the ``RINorm``. Supported parameters are ``{"affine": bool, "eps": float}``. Default: ``False``.
         batch_size
             Number of time series (input and output sequences) used in each training pass. Default: ``32``.
         n_epochs
@@ -296,7 +363,7 @@ class BlockRNNModel(PastCovariatesTorchModel):
         model_name
             Name of the model. Used for creating checkpoints and saving tensorboard data. If not specified,
             defaults to the following string ``"YYYY-mm-dd_HH_MM_SS_torch_model_run_PID"``, where the initial part
-            of the name is formatted with the local date and time, while PID is the processed ID (preventing models
+            of the name is formatted with the local date and time, while PID is the process ID (preventing models
             spawned at the same time by different processes to share the same model_name). E.g.,
             ``"2021-06-14_09_53_32_torch_model_run_44607"``.
         work_dir
@@ -349,7 +416,7 @@ class BlockRNNModel(PastCovariatesTorchModel):
             checkpointing, tensorboard logging, setting the torch device and more.
             With ``pl_trainer_kwargs`` you can add additional kwargs to instantiate the PyTorch Lightning trainer
             object. Check the `PL Trainer documentation
-            <https://pytorch-lightning.readthedocs.io/en/stable/common/trainer.html>`_ for more information about the
+            <https://pytorch-lightning.readthedocs.io/en/stable/common/trainer.html>`__ for more information about the
             supported kwargs. Default: ``None``.
             Running on GPU(s) is also possible using ``pl_trainer_kwargs`` by specifying keys ``"accelerator",
             "devices", and "auto_select_gpus"``. Some examples for setting the devices inside the ``pl_trainer_kwargs``
@@ -357,7 +424,7 @@ class BlockRNNModel(PastCovariatesTorchModel):
 
             - ``{"accelerator": "cpu"}`` for CPU,
             - ``{"accelerator": "gpu", "devices": [i]}`` to use only GPU ``i`` (``i`` must be an integer),
-            - ``{"accelerator": "gpu", "devices": -1, "auto_select_gpus": True}`` to use all available GPUS.
+            - ``{"accelerator": "gpu", "devices": -1, "auto_select_gpus": True}`` to use all available GPUs.
 
             For more info, see here:
             https://pytorch-lightning.readthedocs.io/en/stable/common/trainer.html#trainer-flags , and
@@ -368,7 +435,7 @@ class BlockRNNModel(PastCovariatesTorchModel):
             The model will stop training early if the validation loss `val_loss` does not improve beyond
             specifications. For more information on callbacks, visit:
             `PyTorch Lightning Callbacks
-            <https://pytorch-lightning.readthedocs.io/en/stable/extensions/callbacks.html>`_
+            <https://pytorch-lightning.readthedocs.io/en/stable/extensions/callbacks.html>`__
 
             .. highlight:: python
             .. code-block:: python
@@ -392,6 +459,18 @@ class BlockRNNModel(PastCovariatesTorchModel):
         show_warnings
             whether to show warnings raised from PyTorch Lightning. Useful to detect potential issues of
             your forecasting use case. Default: ``False``.
+        enable_finetuning
+            Enables model fine-tuning. Only effective if not ``None``.
+            If a bool, specifies whether to perform full fine-tuning / training (all parameters are updated) or keep
+            all parameters frozen. If a dict, specifies which parameters to fine-tune. Must only contain one key-value
+            record. Can be used to:
+
+            - Unfreeze specific parameters, while keeping everything else frozen:
+              ``{"unfreeze": ["param.name.patterns.*"]}``
+            - Freeze specific parameters, while keeping everything else unfrozen:
+              ``{"freeze": ["param.name.patterns.*"]}``
+
+            Default: ``None``.
 
         References
         ----------
@@ -416,16 +495,16 @@ class BlockRNNModel(PastCovariatesTorchModel):
         >>> )
         >>> model.fit(target, past_covariates=past_cov)
         >>> pred = model.predict(6)
-        >>> pred.values()
-        array([[4.97979827],
-               [3.9707572 ],
-               [5.27869295],
-               [5.19697244],
-               [5.28424783],
-               [5.22497681]])
+        >>> print(pred.values())
+        [[4.97979827]
+         [3.9707572 ]
+         [5.27869295]
+         [5.19697244]
+         [5.28424783]
+         [5.22497681]]
 
         .. note::
-            `RNN example notebook <https://unit8co.github.io/darts/examples/04-RNN-examples.html>`_ presents techniques
+            `RNN example notebook <https://unit8co.github.io/darts/examples/04-RNN-examples.html>`__ presents techniques
             that can be used to improve the forecasts quality compared to this simple usage example.
         """
         super().__init__(**self._extract_torch_model_params(**self.model_params))
@@ -453,17 +532,29 @@ class BlockRNNModel(PastCovariatesTorchModel):
         self.dropout = dropout
         self.activation = activation
 
-    def _create_model(self, train_sample: TorchTrainingSample) -> torch.nn.Module:
+        self._considers_static_covariates = use_static_covariates
+
+    def _create_model(self, train_sample: TorchTrainingSample) -> PLForecastingModule:
         # samples are made of (past target, past cov, historic future cov, future cov, static cov, future_target)
-        (past_target, past_covariates, _, _, _, _) = train_sample
-        input_dim = past_target.shape[1] + (
-            past_covariates.shape[1] if past_covariates is not None else 0
+        (past_target, past_covariates, _, future_covariates, static_covariates, _) = (
+            train_sample
+        )
+        past_cov_dim = past_covariates.shape[1] if past_covariates is not None else 0
+        future_cov_dim = (
+            future_covariates.shape[1] if future_covariates is not None else 0
+        )
+        static_cov_dim = (
+            static_covariates.shape[0] * static_covariates.shape[1]
+            if static_covariates is not None
+            else 0
+        )
+        input_dim = (
+            past_target.shape[1] + past_cov_dim + future_cov_dim + static_cov_dim
         )
         output_dim = past_target.shape[1]
         nr_params = 1 if self.likelihood is None else self.likelihood.num_parameters
 
         hidden_fc_sizes = [] if self.hidden_fc_sizes is None else self.hidden_fc_sizes
-
         kwargs = {}
         if isinstance(self.rnn_type_or_module, str):
             model_cls = _BlockRNNModule
@@ -475,6 +566,7 @@ class BlockRNNModel(PastCovariatesTorchModel):
             target_size=output_dim,
             nr_params=nr_params,
             hidden_dim=self.hidden_dim,
+            future_cov_dim=future_cov_dim,
             num_layers=self.n_rnn_layers,
             num_layers_out_fc=hidden_fc_sizes,
             dropout=self.dropout,
@@ -490,3 +582,7 @@ class BlockRNNModel(PastCovariatesTorchModel):
             if param not in tfm_save.model_params:
                 tfm_save.model_params[param] = "ReLU"
         super()._check_ckpt_parameters(tfm_save)
+
+    @property
+    def supports_static_covariates(self) -> bool:
+        return True

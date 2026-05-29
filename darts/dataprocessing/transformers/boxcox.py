@@ -4,7 +4,7 @@ Box-Cox Transformer
 """
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -19,6 +19,7 @@ from darts.dataprocessing.transformers.invertible_data_transformer import (
     InvertibleDataTransformer,
 )
 from darts.logging import get_logger, raise_if
+from darts.typing import TimeSeriesLike
 
 logger = get_logger(__name__)
 
@@ -27,13 +28,12 @@ class BoxCox(FittableDataTransformer, InvertibleDataTransformer):
     def __init__(
         self,
         name: str = "BoxCox",
-        lmbda: Optional[
-            Union[float, Sequence[float], Sequence[Sequence[float]]]
-        ] = None,
+        lmbda: float | Sequence[float] | Sequence[Sequence[float]] | None = None,
         optim_method: Literal["mle", "pearsonr"] = "mle",
         global_fit: bool = False,
         n_jobs: int = 1,
         verbose: bool = False,
+        columns: str | list[str] | None = None,
     ):
         """Box-Cox data transformer.
 
@@ -81,6 +81,11 @@ class BoxCox(FittableDataTransformer, InvertibleDataTransformer):
             required amount of time.
         verbose
             Whether to print operations progress
+        columns
+            Optionally, a string or list of strings specifying the names of the components (columns) to transform.
+            If specified, only these components will be transformed, and the remaining components will be kept
+            untouched. For more information refer to the `BaseDataTransformer` documentation. In case the transformer
+            is applied on multiple TimeSeries, it is expected that all series have the same column order.
 
         Examples
         --------
@@ -89,17 +94,12 @@ class BoxCox(FittableDataTransformer, InvertibleDataTransformer):
         >>> series = AirPassengersDataset().load()
         >>> transformer = BoxCox(lmbda=0.2)
         >>> series_transformed = transformer.fit_transform(series)
-        >>> print(series_transformed.head())
-        <TimeSeries (DataArray) (Month: 5, component: 1, sample: 1)>
-        array([[[7.84735157]],
-            [[7.98214351]],
-            [[8.2765364 ]],
-            [[8.21563229]],
-            [[8.04749318]]])
-        Coordinates:
-        * Month      (Month) datetime64[ns] 1949-01-01 1949-02-01 ... 1949-05-01
-        * component  (component) object '#Passengers'
-        Dimensions without coordinates: sample
+        >>> print(series_transformed.values()[:5])
+        [[7.84735157]
+         [7.98214351]
+         [8.2765364 ]
+         [8.21563229]
+         [8.04749318]]
 
         References
         ----------
@@ -127,15 +127,16 @@ class BoxCox(FittableDataTransformer, InvertibleDataTransformer):
             parallel_params=parallel_params,
             mask_components=True,
             global_fit=global_fit,
+            columns=columns,
         )
 
     @staticmethod
     def ts_fit(
-        series: Union[TimeSeries, Sequence[TimeSeries]],
+        series: TimeSeriesLike,
         params: Mapping[str, Any],
         *args,
         **kwargs,
-    ) -> Union[Sequence[float], pd.Series]:
+    ) -> Sequence[float] | pd.Series:
         lmbda, method = params["fixed"]["_lmbda"], params["fixed"]["_optim_method"]
         # If `global_fit` is `True`, then `series` will be ` Sequence[TimeSeries]`;
         # otherwise, `series` is a single `TimeSeries`:
@@ -180,7 +181,10 @@ class BoxCox(FittableDataTransformer, InvertibleDataTransformer):
 
     @staticmethod
     def ts_inverse_transform(
-        series: TimeSeries, params: Mapping[str, Any], **kwargs
+        series: TimeSeries,
+        params: Mapping[str, Any],
+        insample: TimeSeries | None = None,
+        **kwargs,
     ) -> TimeSeries:
         lmbda = params["fitted"]
 

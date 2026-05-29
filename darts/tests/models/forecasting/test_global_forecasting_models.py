@@ -11,7 +11,7 @@ import pytest
 from darts.dataprocessing.transformers import Scaler
 from darts.datasets import AirPassengersDataset
 from darts.metrics import mape
-from darts.tests.conftest import TORCH_AVAILABLE, tfm_kwargs
+from darts.tests.conftest import NF_AVAILABLE, TORCH_AVAILABLE, tfm_kwargs
 from darts.utils import timeseries_generation as tg
 from darts.utils.timeseries_generation import linear_timeseries
 
@@ -195,6 +195,37 @@ models_cls_kwargs_errs = [
     ),
 ]
 
+if NF_AVAILABLE:
+    from darts.models.forecasting.nf_model import NeuralForecastModel
+
+    models_cls_kwargs_errs += [
+        (
+            NeuralForecastModel,
+            {
+                "model": "TiDE",
+                "model_kwargs": {
+                    "hidden_size": 128,
+                    "decoder_output_dim": 16,
+                    "temporal_decoder_dim": 32,
+                    "dropout": 0.1,
+                    "layernorm": False,
+                },
+                "n_epochs": 10,
+                "pl_trainer_kwargs": tfm_kwargs["pl_trainer_kwargs"],
+            },
+            40.0,
+        ),
+        (
+            NeuralForecastModel,
+            {
+                "model": "TSMixerx",
+                "n_epochs": 10,
+                "pl_trainer_kwargs": tfm_kwargs["pl_trainer_kwargs"],
+            },
+            40.0,
+        ),
+    ]
+
 
 class TestGlobalForecastingModels:
     # forecasting horizon used in runnability tests
@@ -276,13 +307,13 @@ class TestGlobalForecastingModels:
                 input_chunk_length=4,
                 hidden_dim=10,
                 batch_size=32,
-                n_epochs=10,
+                n_epochs=1,
                 **tfm_kwargs,
             ),
             TCNModel(
                 input_chunk_length=4,
                 output_chunk_length=3,
-                n_epochs=10,
+                n_epochs=1,
                 batch_size=32,
                 **tfm_kwargs,
             ),
@@ -296,15 +327,31 @@ class TestGlobalForecastingModels:
                 lags_past_covariates=[-1, -2, -3],
                 lags_future_covariates=[1, 2, 3],
             ),
-        ],
+        ]
+        + (
+            [
+                NeuralForecastModel(
+                    input_chunk_length=4,
+                    output_chunk_length=3,
+                    n_epochs=1,
+                    **tfm_kwargs,
+                )
+            ]
+            if NF_AVAILABLE
+            else []
+        ),
     )
     def test_save_load_model(self, tmpdir_fn, model):
         # check if save and load methods work and if loaded model creates same forecasts as original model
         model_path_str = type(model).__name__
         model_clean_path_str = type(model).__name__ + "_clean"
+        model_path_no_predict_str = type(model).__name__ + "_no_predict"
 
         full_model_path_str = os.path.join(tmpdir_fn, model_path_str)
         full_model_clean_path_str = os.path.join(tmpdir_fn, model_clean_path_str)
+        full_model_path_no_predict_str = os.path.join(
+            tmpdir_fn, model_path_no_predict_str
+        )
 
         cov_kwargs = (
             {
@@ -316,6 +363,9 @@ class TestGlobalForecastingModels:
         )
 
         model.fit(series=self.ts_pass_train, **cov_kwargs)
+
+        # test save without predict
+        model.save(full_model_path_no_predict_str)
 
         model_prediction = model.predict(
             self.forecasting_horizon, self.ts_pass_train, **cov_kwargs
@@ -341,8 +391,9 @@ class TestGlobalForecastingModels:
             load_kwargs = {"pl_trainer_kwargs": {"accelerator": "cpu"}}
         else:
             load_kwargs = {}
-        loaded_model_clean_str = type(model).load(
-            full_model_clean_path_str, **load_kwargs
+        loaded_model_clean = type(model).load(full_model_clean_path_str, **load_kwargs)
+        loaded_model_no_predict = type(model).load(
+            full_model_path_no_predict_str, **load_kwargs
         )
 
         assert (
@@ -352,19 +403,34 @@ class TestGlobalForecastingModels:
             == model_prediction
         )
 
+        assert (
+            loaded_model_no_predict.predict(
+                self.forecasting_horizon, self.ts_pass_train, **cov_kwargs
+            )
+            == model_prediction
+        )
+
         # Training data is not stored in the clean model
-        assert loaded_model_clean_str.training_series is None
+        assert loaded_model_clean.training_series is None
 
         # The serie to predict need to be provided at prediction time
         with pytest.raises(ValueError) as err:
-            loaded_model_clean_str.predict(self.forecasting_horizon)
-        assert str(err.value) == (
-            "Input `series` must be provided. This is the result either from fitting on multiple series, "
-            "from not having fit the model yet, or from loading a model saved with `clean=True`."
-        )
+            loaded_model_clean.predict(self.forecasting_horizon)
+        if isinstance(model, TorchForecastingModel):
+            assert str(err.value) == (
+                "Input `series` must be provided. This is the result either from fitting on multiple series, "
+                "from fitting with `fit_from_dataset()`, from not having fit the model yet, or from loading a "
+                "model saved with `clean=True`."
+            )
+        else:
+            assert str(err.value) == (
+                "Input `series` must be provided. This is the result either from fitting on multiple series, "
+                "from not having fit the model yet, or from loading a "
+                "model saved with `clean=True`."
+            )
 
         # When the serie to predict is provided, the prediction is the same
-        assert model_prediction == loaded_model_clean_str.predict(
+        assert model_prediction == loaded_model_clean.predict(
             self.forecasting_horizon, series=self.ts_pass_train, **cov_kwargs
         )
 
@@ -378,8 +444,8 @@ class TestGlobalForecastingModels:
             **kwargs,
         )
         series_copy = self.ts_pass_train.copy()
-        model.fit(self.ts_pass_train)
-        pred = model.predict(n=36)
+        model.fit(self.ts_pass_train, verbose=False)
+        pred = model.predict(n=36, verbose=False)
         mape_err = mape(self.ts_pass_val, pred)
         assert mape_err < err, (
             f"Model {model_cls} produces errors too high (one time "
@@ -705,9 +771,9 @@ class TestGlobalForecastingModels:
         assert isinstance(
             model,
             (
-                PastCovariatesTorchModel,
-                DualCovariatesTorchModel,
-                MixedCovariatesTorchModel,
+                PastCovariatesTorchModel
+                | DualCovariatesTorchModel
+                | MixedCovariatesTorchModel
             ),
         ), "unit test not yet defined for the given {X}CovariatesTorchModel."
 
